@@ -361,6 +361,16 @@ struct ggml_backend_webgpu_buffer_context {
         global_ctx(std::move(global_ctx_)) {}
 };
 
+// GGML_WEBGPU_PAGED_STATS=1: where paged MUL_MAT_ID time goes, printed every 32 graph computes
+struct ggml_webgpu_paged_stats {
+    int64_t readbacks = 0, readback_us = 0, loads = 0, load_bytes = 0, read_us = 0, upload_us = 0, graphs = 0;
+};
+static ggml_webgpu_paged_stats g_paged_stats;
+static bool ggml_webgpu_paged_stats_on() {
+    static const bool on = getenv("GGML_WEBGPU_PAGED_STATS") != nullptr;
+    return on;
+}
+
 static bool ggml_webgpu_buffer_is_paged(ggml_backend_buffer_t buffer) {
     return buffer != nullptr && buffer->context != nullptr &&
            ((ggml_backend_webgpu_buffer_context *) buffer->context)->paged != nullptr;
@@ -3594,7 +3604,10 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
 static std::vector<uint32_t> ggml_webgpu_paged_needed_experts(const ggml_tensor * ids, uint32_t n_expert) {
     const size_t         span = (ids->ne[1] - 1) * ids->nb[1] + ids->ne[0] * sizeof(int32_t);
     std::vector<int32_t> host(CEIL_DIV(span, sizeof(int32_t)));
+    const int64_t        t0 = ggml_time_us();
     ggml_backend_webgpu_buffer_get_tensor(ids->buffer, ids, host.data(), 0, span);
+    g_paged_stats.readbacks++;
+    g_paged_stats.readback_us += ggml_time_us() - t0;
 
     std::vector<uint8_t>  seen(n_expert, 0);
     std::vector<uint32_t> needed;
@@ -3648,10 +3661,16 @@ static void ggml_webgpu_paged_make_resident(webgpu_global_context &       global
         }
 
         const size_t offset = (size_t) e * pg.slab;
+        g_paged_stats.loads++;
+        g_paged_stats.load_bytes += pg.slab;
         if (pg.buft->has_source) {
             staging.resize(pg.slab);
+            const int64_t t0 = ggml_time_us();
             pg.buft->source.read(pg.buft->source.user_data, pg.name.c_str(), offset, staging.data(), pg.slab);
+            const int64_t t1 = ggml_time_us();
             global_ctx->queue.WriteBuffer(pg.pool, (size_t) slot * pg.slab, staging.data(), pg.slab);
+            g_paged_stats.read_us += t1 - t0;
+            g_paged_stats.upload_us += ggml_time_us() - t1;
         } else {
             GGML_ASSERT(pg.ram.size() >= offset + pg.slab);
             global_ctx->queue.WriteBuffer(pg.pool, (size_t) slot * pg.slab, pg.ram.data() + offset, pg.slab);
@@ -3819,6 +3838,14 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
 
     if (contains_set_rows) {
         ggml_backend_webgpu_check_set_rows(ctx, num_inflight_batches);
+    }
+
+    if (paged_ids_tensor != nullptr && ggml_webgpu_paged_stats_on() && ++g_paged_stats.graphs % 32 == 0) {
+        const ggml_webgpu_paged_stats & st = g_paged_stats;
+        GGML_LOG_INFO("ggml_webgpu paged: %lld graphs, %lld readbacks (%.2f ms avg), %lld expert loads (%.1f MB, read %.2f ms avg, upload %.2f ms avg)\n",
+                      (long long) st.graphs, (long long) st.readbacks, st.readbacks ? st.readback_us / 1e3 / st.readbacks : 0.0,
+                      (long long) st.loads, st.load_bytes / 1e6, st.loads ? st.read_us / 1e3 / st.loads : 0.0,
+                      st.loads ? st.upload_us / 1e3 / st.loads : 0.0);
     }
 
     WEBGPU_CPU_PROFILE_TOTAL_END(graph_compute, ctx->global_ctx);
