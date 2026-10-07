@@ -26,6 +26,9 @@ struct ggml_webgpu_page_source {
     void (*write)(void * user_data, const char * tensor_name, size_t offset, const void * data, size_t size);
     // compute time: one expert's bytes, [offset, offset + size) of the tensor
     void (*read)(void * user_data, const char * tensor_name, size_t offset, void * data, size_t size);
+    // optional: n such reads at once, which the source may run concurrently (NULL: `read` is called n times)
+    void (*read_batch)(void * user_data, size_t n, const char * const * tensor_names, const size_t * offsets,
+                       void * const * data, const size_t * sizes);
 };
 
 // source NULL keeps the expert bytes in host memory (a RAM tier). The returned type lives as long as the process.

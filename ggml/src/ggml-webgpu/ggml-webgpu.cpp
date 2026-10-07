@@ -17,6 +17,7 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -3625,26 +3626,29 @@ static std::vector<uint32_t> ggml_webgpu_paged_needed_experts(const ggml_tensor 
     return needed;
 }
 
-// Makes `experts` resident in the pool (at most n_slots of them) and uploads the slot map. With `only`, the map marks
-// every other expert absent, so one pass of a split MUL_MAT_ID computes exactly this subset.
-static void ggml_webgpu_paged_make_resident(webgpu_global_context &       global_ctx,
-                                            webgpu_paged_tensor &         pg,
-                                            const std::vector<uint32_t> & experts,
-                                            bool                          only) {
+// One expert to bring into a pool slot.
+struct ggml_webgpu_paged_load {
+    webgpu_paged_tensor * pg;
+    uint32_t              expert;
+    uint32_t              slot;
+};
+
+// Picks slots for `experts` (at most n_slots of them): hits are pinned for this op, misses take a free slot or the least
+// recently used one this op does not need. Appends the misses to `loads`; reads nothing yet.
+static void ggml_webgpu_paged_assign(webgpu_paged_tensor &                 pg,
+                                     const std::vector<uint32_t> &         experts,
+                                     std::vector<ggml_webgpu_paged_load> & loads) {
     GGML_ASSERT(experts.size() <= pg.n_slots);
     const uint64_t tick = ++pg.tick;
     for (uint32_t e : experts) {
         if (pg.slot_of[e] != WEBGPU_PAGED_ABSENT) {
-            pg.last_use[pg.slot_of[e]] = tick;  // pinned for this op
+            pg.last_use[pg.slot_of[e]] = tick;
         }
     }
-
-    std::vector<uint8_t> staging;
     for (uint32_t e : experts) {
         if (pg.slot_of[e] != WEBGPU_PAGED_ABSENT) {
             continue;
         }
-        // a free slot, else the least recently used one not needed by this op
         uint32_t slot = WEBGPU_PAGED_ABSENT;
         for (uint32_t s = 0; s < pg.n_slots; s++) {
             if (pg.expert_of[s] == WEBGPU_PAGED_ABSENT) {
@@ -3659,27 +3663,81 @@ static void ggml_webgpu_paged_make_resident(webgpu_global_context &       global
         if (pg.expert_of[slot] != WEBGPU_PAGED_ABSENT) {
             pg.slot_of[pg.expert_of[slot]] = WEBGPU_PAGED_ABSENT;
         }
-
-        const size_t offset = (size_t) e * pg.slab;
-        g_paged_stats.loads++;
-        g_paged_stats.load_bytes += pg.slab;
-        if (pg.buft->has_source) {
-            staging.resize(pg.slab);
-            const int64_t t0 = ggml_time_us();
-            pg.buft->source.read(pg.buft->source.user_data, pg.name.c_str(), offset, staging.data(), pg.slab);
-            const int64_t t1 = ggml_time_us();
-            global_ctx->queue.WriteBuffer(pg.pool, (size_t) slot * pg.slab, staging.data(), pg.slab);
-            g_paged_stats.read_us += t1 - t0;
-            g_paged_stats.upload_us += ggml_time_us() - t1;
-        } else {
-            GGML_ASSERT(pg.ram.size() >= offset + pg.slab);
-            global_ctx->queue.WriteBuffer(pg.pool, (size_t) slot * pg.slab, pg.ram.data() + offset, pg.slab);
-        }
-        pg.slot_of[e]       = slot;
-        pg.expert_of[slot]  = e;
-        pg.last_use[slot]   = tick;
+        pg.slot_of[e]      = slot;
+        pg.expert_of[slot] = e;
+        pg.last_use[slot]  = tick;
+        loads.push_back({ &pg, e, slot });
     }
+}
 
+// Reads every load's bytes (one read_batch call per page source when it has one, so a source can read them
+// concurrently) and uploads them into their slots.
+static void ggml_webgpu_paged_fill(webgpu_global_context & global_ctx, const std::vector<ggml_webgpu_paged_load> & loads) {
+    size_t total = 0;
+    for (const auto & l : loads) {
+        total += l.pg->buft->has_source ? l.pg->slab : 0;
+    }
+    std::vector<uint8_t> staging(total);
+
+    // gather the source reads, grouped by buffer type (each has one source)
+    std::vector<const char *> names;
+    std::vector<size_t>       offsets, sizes;
+    std::vector<void *>       dsts;
+    size_t                    at = 0;
+    const int64_t             t0 = ggml_time_us();
+    for (size_t i = 0; i < loads.size(); i++) {
+        const ggml_webgpu_paged_load & l = loads[i];
+        if (!l.pg->buft->has_source) {
+            continue;
+        }
+        names.push_back(l.pg->name.c_str());
+        offsets.push_back((size_t) l.expert * l.pg->slab);
+        sizes.push_back(l.pg->slab);
+        dsts.push_back(staging.data() + at);
+        at += l.pg->slab;
+        const bool last_of_source =
+            i + 1 == loads.size() || loads[i + 1].pg->buft != l.pg->buft || !loads[i + 1].pg->buft->has_source;
+        if (last_of_source) {
+            const ggml_webgpu_page_source & src = l.pg->buft->source;
+            if (src.read_batch != nullptr) {
+                src.read_batch(src.user_data, names.size(), names.data(), offsets.data(), dsts.data(), sizes.data());
+            } else {
+                for (size_t k = 0; k < names.size(); k++) {
+                    src.read(src.user_data, names[k], offsets[k], dsts[k], sizes[k]);
+                }
+            }
+            names.clear();
+            offsets.clear();
+            sizes.clear();
+            dsts.clear();
+        }
+    }
+    const int64_t t1 = ggml_time_us();
+
+    at = 0;
+    for (const auto & l : loads) {
+        const size_t dst = (size_t) l.slot * l.pg->slab;
+        if (l.pg->buft->has_source) {
+            global_ctx->queue.WriteBuffer(l.pg->pool, dst, staging.data() + at, l.pg->slab);
+            at += l.pg->slab;
+        } else {
+            const size_t offset = (size_t) l.expert * l.pg->slab;
+            GGML_ASSERT(l.pg->ram.size() >= offset + l.pg->slab);
+            global_ctx->queue.WriteBuffer(l.pg->pool, dst, l.pg->ram.data() + offset, l.pg->slab);
+        }
+        g_paged_stats.loads++;
+        g_paged_stats.load_bytes += l.pg->slab;
+    }
+    g_paged_stats.read_us += t1 - t0;
+    g_paged_stats.upload_us += ggml_time_us() - t1;
+}
+
+// Uploads the slot map. With `only`, every expert but `experts` is marked absent, so one pass of a split MUL_MAT_ID
+// computes exactly that subset.
+static void ggml_webgpu_paged_upload_map(webgpu_global_context &       global_ctx,
+                                         const webgpu_paged_tensor &   pg,
+                                         const std::vector<uint32_t> & experts,
+                                         bool                          only) {
     if (only) {
         std::vector<uint32_t> map(pg.n_expert, WEBGPU_PAGED_ABSENT);
         for (uint32_t e : experts) {
@@ -3736,9 +3794,11 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         commands.clear();
     };
 
-    // ids already read back in this graph: several paged tensors (gate / up / down) share one router output
-    const ggml_tensor *   paged_ids_tensor = nullptr;
-    std::vector<uint32_t> paged_needed;
+    // ids already read back in this graph: several paged tensors (gate / up / down) share one router output, and are
+    // made resident together, in one batch of reads, at the first of them
+    const ggml_tensor *                       paged_ids_tensor = nullptr;
+    std::vector<uint32_t>                     paged_needed;
+    std::vector<const webgpu_paged_tensor *>  paged_ready;  // resident for paged_ids_tensor, maps uploaded
 
     while (node_idx < cgraph->n_nodes) {
         if (cgraph->nodes[node_idx]->op == GGML_OP_SET_ROWS) {
@@ -3751,17 +3811,41 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                                           ggml_webgpu_paged(node->src[0]) :
                                           nullptr;
         if (paged) {
-            flush_batch();
-            if (paged_ids_tensor != node->src[2]) {
-                paged_needed     = ggml_webgpu_paged_needed_experts(node->src[2], paged->n_expert);
-                paged_ids_tensor = node->src[2];
+            const bool ready = paged_ids_tensor == node->src[2] &&
+                               std::find(paged_ready.begin(), paged_ready.end(), paged) != paged_ready.end();
+            if (!ready) {
+                flush_batch();
+                if (paged_ids_tensor != node->src[2]) {
+                    paged_needed     = ggml_webgpu_paged_needed_experts(node->src[2], paged->n_expert);
+                    paged_ids_tensor = node->src[2];
+                    paged_ready.clear();
+                }
             }
-            // more experts than slots (prefill): one pass per slot-sized subset; outputs of the passes are disjoint
             const bool split = paged_needed.size() > paged->n_slots;
-            for (size_t first = 0; first < paged_needed.size(); first += paged->n_slots) {
-                const size_t          last = std::min(paged_needed.size(), first + paged->n_slots);
-                std::vector<uint32_t> part(paged_needed.begin() + first, paged_needed.begin() + last);
-                ggml_webgpu_paged_make_resident(ctx->global_ctx, *paged, part, split);
+            if (!ready && !split) {
+                // this op and every later paged op routed by the same ids: assign slots, read all misses at once
+                std::vector<webgpu_paged_tensor *> group = { paged };
+                for (int j = node_idx + 1; j < cgraph->n_nodes; j++) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == node->src[2]) {
+                        webgpu_paged_tensor * other = ggml_webgpu_paged(n->src[0]);
+                        if (other && other->n_slots >= paged_needed.size() &&
+                            std::find(group.begin(), group.end(), other) == group.end()) {
+                            group.push_back(other);
+                        }
+                    }
+                }
+                std::vector<ggml_webgpu_paged_load> loads;
+                for (webgpu_paged_tensor * pg : group) {
+                    ggml_webgpu_paged_assign(*pg, paged_needed, loads);
+                }
+                ggml_webgpu_paged_fill(ctx->global_ctx, loads);
+                for (webgpu_paged_tensor * pg : group) {
+                    ggml_webgpu_paged_upload_map(ctx->global_ctx, *pg, paged_needed, false);
+                    paged_ready.push_back(pg);
+                }
+            }
+            if (!split) {
                 if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
                     commands.push_back(*cmd);
                     num_batched_kernels += cmd.value().num_kernels;
@@ -3770,7 +3854,23 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                                                   cmd->pipeline_names.end());
 #endif
                 }
-                if (split) {
+            } else {
+                // more experts than slots (prefill): one pass per slot-sized subset; outputs of the passes are disjoint
+                for (size_t first = 0; first < paged_needed.size(); first += paged->n_slots) {
+                    const size_t          last = std::min(paged_needed.size(), first + paged->n_slots);
+                    std::vector<uint32_t> part(paged_needed.begin() + first, paged_needed.begin() + last);
+                    std::vector<ggml_webgpu_paged_load> loads;
+                    ggml_webgpu_paged_assign(*paged, part, loads);
+                    ggml_webgpu_paged_fill(ctx->global_ctx, loads);
+                    ggml_webgpu_paged_upload_map(ctx->global_ctx, *paged, part, true);
+                    if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
+                        commands.push_back(*cmd);
+                        num_batched_kernels += cmd.value().num_kernels;
+#ifdef GGML_WEBGPU_GPU_PROFILE
+                        profile_pipeline_names.insert(profile_pipeline_names.end(), cmd->pipeline_names.begin(),
+                                                      cmd->pipeline_names.end());
+#endif
+                    }
                     flush_batch();  // the next pass overwrites slots this one reads
                 }
             }
@@ -4820,7 +4920,7 @@ static ggml_backend_buffer_type_t * ggml_backend_webgpu_dev_get_extra_bufts(ggml
         }
         const char *            path = getenv("GGML_WEBGPU_PAGED_FILE");
         ggml_webgpu_page_source src  = { &gguf_src, ggml_webgpu_gguf_source_has, ggml_webgpu_gguf_source_write,
-                                         ggml_webgpu_gguf_source_read };
+                                         ggml_webgpu_gguf_source_read, nullptr };
         if (path != nullptr && !ggml_webgpu_gguf_source_open(gguf_src, path)) {
             GGML_ABORT("ggml_webgpu: cannot open GGML_WEBGPU_PAGED_FILE %s", path);
         }
