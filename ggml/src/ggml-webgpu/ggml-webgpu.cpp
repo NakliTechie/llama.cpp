@@ -3612,6 +3612,19 @@ static std::vector<uint32_t> ggml_webgpu_paged_needed_experts(const ggml_tensor 
     g_paged_stats.readbacks++;
     g_paged_stats.readback_us += ggml_time_us() - t0;
 
+    // GGML_WEBGPU_PAGED_TRACE=<file>: one line per readback, "<ids tensor name> <n_tokens> <expert ids...>"
+    static FILE * trace = getenv("GGML_WEBGPU_PAGED_TRACE") ? fopen(getenv("GGML_WEBGPU_PAGED_TRACE"), "w") : nullptr;
+    if (trace) {
+        fprintf(trace, "%s %lld", ids->name, (long long) ids->ne[1]);
+        for (int64_t t = 0; t < ids->ne[1]; t++) {
+            for (int64_t k = 0; k < ids->ne[0]; k++) {
+                fprintf(trace, " %d", host[t * (ids->nb[1] / sizeof(int32_t)) + k]);
+            }
+        }
+        fprintf(trace, "\n");
+        fflush(trace);
+    }
+
     std::vector<uint8_t>  seen(n_expert, 0);
     std::vector<uint32_t> needed;
     for (int64_t t = 0; t < ids->ne[1]; t++) {
@@ -3801,6 +3814,13 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         }
         ctx->param_arena.reset();
         commands.clear();
+#ifdef GGML_WEBGPU_GPU_PROFILE
+        if (ctx->profile_timestamp_query_count + 2 * ctx->global_ctx->command_submit_batch_size >= WEBGPU_MAX_PROFILE_QUERY_COUNT) {
+            ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches);
+            ctx->profile_timestamp_query_count = 0;
+            profile_pipeline_names.clear();
+        }
+#endif
     };
 
     // ids already read back in this graph: several paged tensors (gate / up / down) share one router output, and are

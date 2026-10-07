@@ -2593,6 +2593,15 @@ class ggml_webgpu_shader_lib {
             outputs_per_wg = WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG;
         }
 
+        // experiment (remove before any upstream PR): GGML_WEBGPU_MMID_VEC=<wg_size>x<outputs_per_wg>
+        if (const char * e = getenv("GGML_WEBGPU_MMID_VEC")) {
+            unsigned w = 0, o = 0;
+            if (sscanf(e, "%ux%u", &w, &o) == 2 && w && o) {
+                wg_size        = w;
+                outputs_per_wg = o;
+            }
+        }
+
         // variant suffix for src1 type
         variant += std::string("_") + (context.src1->type == GGML_TYPE_F32 ? "f32" : "f16");
 
