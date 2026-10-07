@@ -144,7 +144,7 @@ int main() {
     std::mt19937 rng(42);
     int          failed = 0;
     for (const config & c : configs) {
-        // weights: random f32 → quantized to the test type
+        // weights: random f32, quantized to the test type
         const size_t       n_el = (size_t) c.k * c.m * c.n_expert;
         std::vector<float> w(n_el);
         std::uniform_real_distribution<float> u(-1.0f, 1.0f);
