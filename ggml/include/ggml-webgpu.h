@@ -29,6 +29,10 @@ struct ggml_webgpu_page_source {
     // optional: n such reads at once, which the source may run concurrently (NULL: `read` is called n times)
     void (*read_batch)(void * user_data, size_t n, const char * const * tensor_names, const size_t * offsets,
                        void * const * data, const size_t * sizes);
+    // optional: put n such ranges straight into GPU buffers (WGPUBuffer at dst_offsets) on the device's queue, e.g. through
+    // mapped staging buffers. Used instead of read/read_batch when set; must be queued before it returns.
+    void (*upload_batch)(void * user_data, void * device, size_t n, const char * const * tensor_names,
+                         const size_t * offsets, const size_t * sizes, void * const * dst_buffers, const size_t * dst_offsets);
 };
 
 // source NULL keeps the expert bytes in host memory (a RAM tier). The returned type lives as long as the process.

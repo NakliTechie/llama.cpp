@@ -177,7 +177,7 @@ int main() {
         }
 
         page_store              store;
-        ggml_webgpu_page_source src = { &store, store_has, store_write, store_read, store_read_batch };
+        ggml_webgpu_page_source src = { &store, store_has, store_write, store_read, store_read_batch, nullptr };
         ggml_backend_buffer_type_t pbuft = paged_buft(dev, c.n_slots, c.source ? &src : nullptr);
 
         auto ref = run(backend, ggml_backend_dev_buffer_type(dev), c, as_data, b_data, rounds);

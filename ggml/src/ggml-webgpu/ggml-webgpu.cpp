@@ -362,14 +362,16 @@ struct ggml_backend_webgpu_buffer_context {
         global_ctx(std::move(global_ctx_)) {}
 };
 
-// GGML_WEBGPU_PAGED_STATS=1: where paged MUL_MAT_ID time goes, printed every 32 graph computes
+// GGML_WEBGPU_PAGED_STATS=1: where paged MUL_MAT_ID time goes, printed every 32 graph computes; =2 also drains the
+// queue before each readback to split GPU work from the round trip (adds a sync)
 struct ggml_webgpu_paged_stats {
     int64_t readbacks = 0, readback_us = 0, loads = 0, load_bytes = 0, read_us = 0, upload_us = 0, graphs = 0;
+    int64_t flush_us = 0, gpu_wait_us = 0;
 };
 static ggml_webgpu_paged_stats g_paged_stats;
-static bool ggml_webgpu_paged_stats_on() {
-    static const bool on = getenv("GGML_WEBGPU_PAGED_STATS") != nullptr;
-    return on;
+static int ggml_webgpu_paged_stats_level() {
+    static const int level = getenv("GGML_WEBGPU_PAGED_STATS") ? atoi(getenv("GGML_WEBGPU_PAGED_STATS")) : 0;
+    return level;
 }
 
 static bool ggml_webgpu_buffer_is_paged(ggml_backend_buffer_t buffer) {
@@ -3670,60 +3672,67 @@ static void ggml_webgpu_paged_assign(webgpu_paged_tensor &                 pg,
     }
 }
 
-// Reads every load's bytes (one read_batch call per page source when it has one, so a source can read them
-// concurrently) and uploads them into their slots.
+// Brings every load's bytes into its slot. Per page source, in one call: upload_batch when the source has it (the
+// source writes the GPU buffers itself), else read_batch (or read) into staging and a queue write per expert.
 static void ggml_webgpu_paged_fill(webgpu_global_context & global_ctx, const std::vector<ggml_webgpu_paged_load> & loads) {
-    size_t total = 0;
-    for (const auto & l : loads) {
-        total += l.pg->buft->has_source ? l.pg->slab : 0;
-    }
-    std::vector<uint8_t> staging(total);
+    const int64_t        t0 = ggml_time_us();
+    std::vector<uint8_t> staging;
+    std::vector<size_t>  staged(loads.size(), SIZE_MAX);  // offset in staging, per load read on the CPU
 
-    // gather the source reads, grouped by buffer type (each has one source)
-    std::vector<const char *> names;
-    std::vector<size_t>       offsets, sizes;
-    std::vector<void *>       dsts;
-    size_t                    at = 0;
-    const int64_t             t0 = ggml_time_us();
-    for (size_t i = 0; i < loads.size(); i++) {
-        const ggml_webgpu_paged_load & l = loads[i];
-        if (!l.pg->buft->has_source) {
-            continue;
+    for (size_t first = 0; first < loads.size();) {
+        // [first, last): consecutive loads of one buffer type (one source)
+        size_t last = first + 1;
+        while (last < loads.size() && loads[last].pg->buft == loads[first].pg->buft) {
+            last++;
         }
-        names.push_back(l.pg->name.c_str());
-        offsets.push_back((size_t) l.expert * l.pg->slab);
-        sizes.push_back(l.pg->slab);
-        dsts.push_back(staging.data() + at);
-        at += l.pg->slab;
-        const bool last_of_source =
-            i + 1 == loads.size() || loads[i + 1].pg->buft != l.pg->buft || !loads[i + 1].pg->buft->has_source;
-        if (last_of_source) {
-            const ggml_webgpu_page_source & src = l.pg->buft->source;
-            if (src.read_batch != nullptr) {
-                src.read_batch(src.user_data, names.size(), names.data(), offsets.data(), dsts.data(), sizes.data());
+        ggml_webgpu_paged_buft_context * buft = loads[first].pg->buft;
+        if (buft->has_source) {
+            std::vector<const char *> names;
+            std::vector<size_t>       offsets, sizes, dst_offsets;
+            std::vector<void *>       dsts;
+            for (size_t i = first; i < last; i++) {
+                names.push_back(loads[i].pg->name.c_str());
+                offsets.push_back((size_t) loads[i].expert * loads[i].pg->slab);
+                sizes.push_back(loads[i].pg->slab);
+            }
+            const ggml_webgpu_page_source & src = buft->source;
+            if (src.upload_batch != nullptr) {
+                for (size_t i = first; i < last; i++) {
+                    dsts.push_back(loads[i].pg->pool.Get());
+                    dst_offsets.push_back((size_t) loads[i].slot * loads[i].pg->slab);
+                }
+                src.upload_batch(src.user_data, global_ctx->device.Get(), names.size(), names.data(), offsets.data(),
+                                 sizes.data(), dsts.data(), dst_offsets.data());
             } else {
-                for (size_t k = 0; k < names.size(); k++) {
-                    src.read(src.user_data, names[k], offsets[k], dsts[k], sizes[k]);
+                for (size_t i = first; i < last; i++) {
+                    staged[i] = staging.size();
+                    staging.resize(staging.size() + loads[i].pg->slab);
+                }
+                for (size_t i = first; i < last; i++) {
+                    dsts.push_back(staging.data() + staged[i]);
+                }
+                if (src.read_batch != nullptr) {
+                    src.read_batch(src.user_data, names.size(), names.data(), offsets.data(), dsts.data(), sizes.data());
+                } else {
+                    for (size_t k = 0; k < names.size(); k++) {
+                        src.read(src.user_data, names[k], offsets[k], dsts[k], sizes[k]);
+                    }
                 }
             }
-            names.clear();
-            offsets.clear();
-            sizes.clear();
-            dsts.clear();
         }
+        first = last;
     }
     const int64_t t1 = ggml_time_us();
 
-    at = 0;
-    for (const auto & l : loads) {
-        const size_t dst = (size_t) l.slot * l.pg->slab;
-        if (l.pg->buft->has_source) {
-            global_ctx->queue.WriteBuffer(l.pg->pool, dst, staging.data() + at, l.pg->slab);
-            at += l.pg->slab;
-        } else {
+    for (size_t i = 0; i < loads.size(); i++) {
+        const ggml_webgpu_paged_load & l   = loads[i];
+        const size_t                   dst = (size_t) l.slot * l.pg->slab;
+        if (!l.pg->buft->has_source) {
             const size_t offset = (size_t) l.expert * l.pg->slab;
             GGML_ASSERT(l.pg->ram.size() >= offset + l.pg->slab);
             global_ctx->queue.WriteBuffer(l.pg->pool, dst, l.pg->ram.data() + offset, l.pg->slab);
+        } else if (staged[i] != SIZE_MAX) {
+            global_ctx->queue.WriteBuffer(l.pg->pool, dst, staging.data() + staged[i], l.pg->slab);
         }
         g_paged_stats.loads++;
         g_paged_stats.load_bytes += l.pg->slab;
@@ -3814,7 +3823,14 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
             const bool ready = paged_ids_tensor == node->src[2] &&
                                std::find(paged_ready.begin(), paged_ready.end(), paged) != paged_ready.end();
             if (!ready) {
+                const int64_t tf0 = ggml_time_us();
                 flush_batch();
+                const int64_t tf1 = ggml_time_us();
+                if (ggml_webgpu_paged_stats_level() >= 2) {
+                    ggml_backend_webgpu_wait_queue(ctx->global_ctx);  // split GPU work from the readback round trip
+                }
+                g_paged_stats.flush_us += tf1 - tf0;
+                g_paged_stats.gpu_wait_us += ggml_time_us() - tf1;
                 if (paged_ids_tensor != node->src[2]) {
                     paged_needed     = ggml_webgpu_paged_needed_experts(node->src[2], paged->n_expert);
                     paged_ids_tensor = node->src[2];
@@ -3940,10 +3956,11 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         ggml_backend_webgpu_check_set_rows(ctx, num_inflight_batches);
     }
 
-    if (paged_ids_tensor != nullptr && ggml_webgpu_paged_stats_on() && ++g_paged_stats.graphs % 32 == 0) {
+    if (paged_ids_tensor != nullptr && ggml_webgpu_paged_stats_level() >= 1 && ++g_paged_stats.graphs % 32 == 0) {
         const ggml_webgpu_paged_stats & st = g_paged_stats;
-        GGML_LOG_INFO("ggml_webgpu paged: %lld graphs, %lld readbacks (%.2f ms avg), %lld expert loads (%.1f MB, read %.2f ms avg, upload %.2f ms avg)\n",
-                      (long long) st.graphs, (long long) st.readbacks, st.readbacks ? st.readback_us / 1e3 / st.readbacks : 0.0,
+        GGML_LOG_INFO("ggml_webgpu paged: %lld graphs, %lld readbacks (flush %.2f + gpu %.2f + round trip %.2f ms avg), %lld expert loads (%.1f MB, read %.2f ms avg, upload %.2f ms avg)\n",
+                      (long long) st.graphs, (long long) st.readbacks, st.readbacks ? st.flush_us / 1e3 / st.readbacks : 0.0,
+                      st.readbacks ? st.gpu_wait_us / 1e3 / st.readbacks : 0.0, st.readbacks ? st.readback_us / 1e3 / st.readbacks : 0.0,
                       (long long) st.loads, st.load_bytes / 1e6, st.loads ? st.read_us / 1e3 / st.loads : 0.0,
                       st.loads ? st.upload_us / 1e3 / st.loads : 0.0);
     }
@@ -4920,7 +4937,7 @@ static ggml_backend_buffer_type_t * ggml_backend_webgpu_dev_get_extra_bufts(ggml
         }
         const char *            path = getenv("GGML_WEBGPU_PAGED_FILE");
         ggml_webgpu_page_source src  = { &gguf_src, ggml_webgpu_gguf_source_has, ggml_webgpu_gguf_source_write,
-                                         ggml_webgpu_gguf_source_read, nullptr };
+                                         ggml_webgpu_gguf_source_read, nullptr, nullptr };
         if (path != nullptr && !ggml_webgpu_gguf_source_open(gguf_src, path)) {
             GGML_ABORT("ggml_webgpu: cannot open GGML_WEBGPU_PAGED_FILE %s", path);
         }
