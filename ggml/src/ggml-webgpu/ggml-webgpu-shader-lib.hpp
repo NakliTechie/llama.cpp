@@ -93,6 +93,7 @@ struct ggml_webgpu_shader_lib_context {
     uint32_t    min_subgroup_size        = 0;
     uint32_t    max_subgroup_size        = 0;
     bool        supports_dot_product     = false;
+    bool        src0_paged               = false;  // MUL_MAT_ID: src0 is a paged expert pool read through a slot map
     std::string vendor;
 };
 
@@ -1059,10 +1060,11 @@ struct ggml_webgpu_mul_mat_id_pipeline_key {
     uint32_t  n_experts;
     uint32_t  num_cols;
     int       vectorized;
+    bool      paged;
 
     bool operator==(const ggml_webgpu_mul_mat_id_pipeline_key & other) const {
         return src0_type == other.src0_type && src1_type == other.src1_type && n_experts == other.n_experts &&
-               num_cols == other.num_cols && vectorized == other.vectorized;
+               num_cols == other.num_cols && vectorized == other.vectorized && paged == other.paged;
     }
 };
 
@@ -1074,6 +1076,7 @@ struct ggml_webgpu_mul_mat_id_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.n_experts);
         ggml_webgpu_hash_combine(seed, key.num_cols);
         ggml_webgpu_hash_combine(seed, key.vectorized);
+        ggml_webgpu_hash_combine(seed, key.paged);
         return seed;
     }
 };
@@ -2325,20 +2328,25 @@ class ggml_webgpu_shader_lib {
     }
 
     webgpu_pipeline get_mul_mat_id_gather_pipeline(const ggml_webgpu_shader_lib_context & context) {
-        auto it = mul_mat_id_gather_pipelines.find(1);
+        const int key = context.src0_paged ? 2 : 1;
+        auto      it  = mul_mat_id_gather_pipelines.find(key);
         if (it != mul_mat_id_gather_pipelines.end()) {
             return it->second;
         }
         std::vector<std::string> defines;
         defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        if (context.src0_paged) {
+            defines.push_back("PAGED");
+        }
 
         auto processed     = preprocessor.preprocess(wgsl_mul_mat_id_gather, defines);
         auto decisions     = std::make_shared<ggml_webgpu_generic_shader_decisions>();
         decisions->wg_size = context.max_wg_size;
 
-        webgpu_pipeline pipeline       = ggml_webgpu_create_pipeline(device, processed, "mul_mat_id_gather");
-        pipeline.context               = decisions;
-        mul_mat_id_gather_pipelines[1] = pipeline;
+        webgpu_pipeline pipeline =
+            ggml_webgpu_create_pipeline(device, processed, context.src0_paged ? "mul_mat_id_gather_paged" : "mul_mat_id_gather");
+        pipeline.context                 = decisions;
+        mul_mat_id_gather_pipelines[key] = pipeline;
         return pipeline;
     }
 
@@ -2351,6 +2359,7 @@ class ggml_webgpu_shader_lib {
                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                              1 :
                              0;
+        key.paged = context.src0_paged;
 
         auto it = mul_mat_id_pipelines.find(key);
         if (it != mul_mat_id_pipelines.end()) {
@@ -2458,6 +2467,10 @@ class ggml_webgpu_shader_lib {
         if (key.vectorized) {
             variant += "_vectorized";
         }
+        if (key.paged) {
+            defines.push_back("PAGED");
+            variant += "_paged";
+        }
 
         auto processed = preprocessor.preprocess(wgsl_mul_mat_id, defines);
 
@@ -2484,6 +2497,7 @@ class ggml_webgpu_shader_lib {
                           (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                              1 :
                              0;
+        key.paged = context.src0_paged;
 
         auto it = mul_mat_id_vec_pipelines.find(key);
         if (it != mul_mat_id_vec_pipelines.end()) {
@@ -2592,6 +2606,10 @@ class ggml_webgpu_shader_lib {
         defines.push_back(std::string("NUM_COLS=1"));
 
         defines.push_back(std::string("N_EXPERTS=") + std::to_string(key.n_experts));
+        if (key.paged) {
+            defines.push_back("PAGED");
+            variant += "_paged";
+        }
 
         auto processed = preprocessor.preprocess(shader_src, defines);
 
