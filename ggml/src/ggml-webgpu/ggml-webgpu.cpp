@@ -9,6 +9,7 @@
 #include "ggml-impl.h"
 #include "ggml-webgpu-shader-lib.hpp"
 #include "ggml.h"
+#include "gguf.h"
 
 #ifdef __EMSCRIPTEN__
 #    include <emscripten/emscripten.h>
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #ifdef GGML_WEBGPU_GPU_PROFILE
 #    include <iomanip>
 #endif
@@ -4733,15 +4735,69 @@ ggml_backend_buffer_type_t ggml_backend_webgpu_paged_buffer_type(ggml_backend_de
     return bufts.back().get();
 }
 
-// The `-ot exps=WebGPU_Paged` buffer type: listed only when GGML_WEBGPU_PAGED_SLOTS is set (experts kept in host memory).
+// A page source over a GGUF file: experts are read back from the model file itself, nothing is copied at load.
+struct ggml_webgpu_gguf_page_source {
+    FILE *                                  file = nullptr;
+    std::unordered_map<std::string, size_t> offsets;  // tensor name -> absolute file offset of its data
+    std::mutex                              mutex;
+};
+
+static bool ggml_webgpu_gguf_source_has(void * ud, const char * name, size_t nbytes) {
+    GGML_UNUSED(nbytes);
+    auto * src = (ggml_webgpu_gguf_page_source *) ud;
+    return src->offsets.count(name) != 0;
+}
+
+[[noreturn]] static void ggml_webgpu_gguf_source_write(void * ud, const char * name, size_t off, const void * data, size_t size) {
+    GGML_UNUSED(ud);
+    GGML_UNUSED(off);
+    GGML_UNUSED(data);
+    GGML_UNUSED(size);
+    GGML_ABORT("ggml_webgpu: tensor %s is not in GGML_WEBGPU_PAGED_FILE", name);
+}
+
+static void ggml_webgpu_gguf_source_read(void * ud, const char * name, size_t off, void * data, size_t size) {
+    auto * src = (ggml_webgpu_gguf_page_source *) ud;
+    auto   it  = src->offsets.find(name);
+    GGML_ASSERT(it != src->offsets.end());
+    std::lock_guard<std::mutex> lock(src->mutex);
+    GGML_ASSERT(fseeko(src->file, (off_t) (it->second + off), SEEK_SET) == 0);
+    GGML_ASSERT(fread(data, 1, size, src->file) == size);
+}
+
+static bool ggml_webgpu_gguf_source_open(ggml_webgpu_gguf_page_source & src, const char * path) {
+    gguf_init_params params = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context *   gguf   = gguf_init_from_file(path, params);
+    if (gguf == nullptr) {
+        return false;
+    }
+    const size_t base = gguf_get_data_offset(gguf);
+    for (int64_t i = 0; i < gguf_get_n_tensors(gguf); i++) {
+        src.offsets[gguf_get_tensor_name(gguf, i)] = base + gguf_get_tensor_offset(gguf, i);
+    }
+    gguf_free(gguf);
+    src.file = fopen(path, "rb");
+    return src.file != nullptr;
+}
+
+// The `-ot exps=WebGPU_Paged` buffer type, listed only when GGML_WEBGPU_PAGED_SLOTS is set. Experts are read from
+// GGML_WEBGPU_PAGED_FILE (the model's GGUF) when it is set, else kept in host memory.
 static ggml_backend_buffer_type_t * ggml_backend_webgpu_dev_get_extra_bufts(ggml_backend_dev_t dev) {
-    static ggml_backend_buffer_type_t bufts[2] = { nullptr, nullptr };
-    static std::once_flag             once;
+    static ggml_backend_buffer_type_t   bufts[2] = { nullptr, nullptr };
+    static ggml_webgpu_gguf_page_source gguf_src;
+    static std::once_flag               once;
     std::call_once(once, [dev]() {
         const char * env = getenv("GGML_WEBGPU_PAGED_SLOTS");
-        if (env != nullptr && atoi(env) > 0) {
-            bufts[0] = ggml_backend_webgpu_paged_buffer_type(dev, (uint32_t) atoi(env), nullptr);
+        if (env == nullptr || atoi(env) <= 0) {
+            return;
         }
+        const char *            path = getenv("GGML_WEBGPU_PAGED_FILE");
+        ggml_webgpu_page_source src  = { &gguf_src, ggml_webgpu_gguf_source_has, ggml_webgpu_gguf_source_write,
+                                         ggml_webgpu_gguf_source_read };
+        if (path != nullptr && !ggml_webgpu_gguf_source_open(gguf_src, path)) {
+            GGML_ABORT("ggml_webgpu: cannot open GGML_WEBGPU_PAGED_FILE %s", path);
+        }
+        bufts[0] = ggml_backend_webgpu_paged_buffer_type(dev, (uint32_t) atoi(env), path ? &src : nullptr);
     });
     return bufts;
 }
@@ -4799,8 +4855,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             return false;
         }
     }
-    if (ggml_webgpu_buffer_is_paged(op->buffer)) {
-        return false;
+    if (ggml_webgpu_buffer_is_paged(op->buffer) && op->op != GGML_OP_NONE) {
+        return false;  // a paged buffer holds weights (graph leaves), never op results
     }
     const bool src0_paged = src0 != nullptr && ggml_webgpu_buffer_is_paged(src0->buffer);
 
@@ -5228,6 +5284,9 @@ static void * ggml_backend_webgpu_reg_get_proc_address(ggml_backend_reg_t reg, c
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         return (void *) ggml_backend_webgpu_dev_get_extra_bufts;
+    }
+    if (strcmp(name, "ggml_backend_webgpu_paged_buffer_type") == 0) {
+        return (void *) ggml_backend_webgpu_paged_buffer_type;
     }
     return nullptr;
 }
