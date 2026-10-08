@@ -54,6 +54,8 @@
 #define WEBGPU_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG    4
 #define WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG 4
 #define WEBGPU_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG      4
+#define WEBGPU_MUL_MAT_ID_VEC_LEGACY_Q_WG_SIZE         64
+#define WEBGPU_MUL_MAT_ID_VEC_LEGACY_Q_OUTPUTS_PER_WG  8
 
 // default size for reg-tile matrix multiplication
 #define WEBGPU_MUL_MAT_WG_SIZE 256
@@ -2593,13 +2595,11 @@ class ggml_webgpu_shader_lib {
             outputs_per_wg = WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG;
         }
 
-        // experiment (remove before any upstream PR): GGML_WEBGPU_MMID_VEC=<wg_size>x<outputs_per_wg>
-        if (const char * e = getenv("GGML_WEBGPU_MMID_VEC")) {
-            unsigned w = 0, o = 0;
-            if (sscanf(e, "%ux%u", &w, &o) == 2 && w && o) {
-                wg_size        = w;
-                outputs_per_wg = o;
-            }
+        // MoE experts are small matrices (few blocks per row), so a narrower workgroup with more rows keeps more
+        // threads busy; measured on Q4_0 (Gemma 4 26B-A4B, k = 704 / 2816)
+        if (key.src0_type >= GGML_TYPE_Q4_0 && key.src0_type < GGML_TYPE_Q2_K) {
+            wg_size        = WEBGPU_MUL_MAT_ID_VEC_LEGACY_Q_WG_SIZE;
+            outputs_per_wg = WEBGPU_MUL_MAT_ID_VEC_LEGACY_Q_OUTPUTS_PER_WG;
         }
 
         // variant suffix for src1 type
