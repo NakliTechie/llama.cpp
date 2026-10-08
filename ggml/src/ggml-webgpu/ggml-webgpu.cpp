@@ -369,7 +369,7 @@ struct ggml_webgpu_paged_stats {
     int64_t readbacks = 0, readback_us = 0, loads = 0, load_bytes = 0, read_us = 0, upload_us = 0, graphs = 0;
     int64_t flush_us = 0, gpu_wait_us = 0;
     int64_t pred_layers = 0, pred_misses = 0, pred_covered = 0;  // lookahead: misses at a predicted layer, and guessed
-    int64_t guess_loads = 0, guess_used = 0;  // guessed experts loaded early into slots; routed to (first tensor)
+    int64_t guess_loads = 0, guess_used = 0, guess_us = 0;  // guessed experts loaded early into slots; routed to (first tensor)
     int64_t compute_us = 0, fill_us = 0;  // whole graph computes with paged experts; whole fills
     int64_t prefetch_reads = 0, prefetch_used = 0, prefetch_wait_us = 0;  // guesses read ahead, later routed to
 };
@@ -4028,7 +4028,9 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                         ggml_webgpu_paged_assign_guess(*pg, paged_guess.experts, loads);
                     }
                     g_paged_stats.guess_loads += loads.size();
+                    const int64_t tg = ggml_time_us();
                     ggml_webgpu_paged_fill(ctx->global_ctx, loads, &paged_ra[paged_guess.layer & 1]);
+                    g_paged_stats.guess_us += ggml_time_us() - tg;
                     paged_guess.layer = -1;  // loaded; the routing below counts what it covered
                     paged_guess_done  = true;
                 }
@@ -4210,8 +4212,8 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                       (long long) st.loads, st.load_bytes / 1e6, st.loads ? st.read_us / 1e3 / st.loads : 0.0,
                       st.loads ? st.upload_us / 1e3 / st.loads : 0.0);
         if (st.guess_loads > 0) {
-            GGML_LOG_INFO("ggml_webgpu paged: guesses loaded early %lld, routed to %lld (first tensor of each layer)\n",
-                          (long long) st.guess_loads, (long long) st.guess_used);
+            GGML_LOG_INFO("ggml_webgpu paged: guesses loaded early %lld (%.1f ms per graph), routed to %lld (first tensor of each layer)\n",
+                          (long long) st.guess_loads, st.guess_us / 1e3 / st.graphs, (long long) st.guess_used);
         }
         if (st.pred_layers > 0) {
             GGML_LOG_INFO("ggml_webgpu paged: lookahead at %lld layers: %lld misses, %lld guessed (%.1f%%)\n",
