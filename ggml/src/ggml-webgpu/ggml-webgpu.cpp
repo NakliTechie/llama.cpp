@@ -33,6 +33,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <future>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -367,6 +368,10 @@ struct ggml_backend_webgpu_buffer_context {
 struct ggml_webgpu_paged_stats {
     int64_t readbacks = 0, readback_us = 0, loads = 0, load_bytes = 0, read_us = 0, upload_us = 0, graphs = 0;
     int64_t flush_us = 0, gpu_wait_us = 0;
+    int64_t pred_layers = 0, pred_misses = 0, pred_covered = 0;  // lookahead: misses at a predicted layer, and guessed
+    int64_t guess_loads = 0, guess_used = 0;  // guessed experts loaded early into slots; routed to (first tensor)
+    int64_t compute_us = 0, fill_us = 0;  // whole graph computes with paged experts; whole fills
+    int64_t prefetch_reads = 0, prefetch_used = 0, prefetch_wait_us = 0;  // guesses read ahead, later routed to
 };
 static ggml_webgpu_paged_stats g_paged_stats;
 static int ggml_webgpu_paged_stats_level() {
@@ -3641,6 +3646,19 @@ static std::vector<uint32_t> ggml_webgpu_paged_needed_experts(const ggml_tensor 
     return needed;
 }
 
+// The layer of a tensor named "<base>-<il>", or -1.
+static int ggml_webgpu_paged_layer(const char * name) {
+    const char * dash = strrchr(name, '-');
+    return dash != nullptr && dash[1] >= '0' && dash[1] <= '9' ? atoi(dash + 1) : -1;
+}
+
+// A guess of the next MoE layer's experts ("ffn_moe_pred-<il>", from LLAMA_MOE_LOOKAHEAD): read back with layer il's
+// ids, used at layer il + 1 when its ids are known. Decode only (one token).
+struct ggml_webgpu_paged_guess {
+    int                   layer = -1;  // the layer the guess is for
+    std::vector<uint32_t> experts;
+};
+
 // One expert to bring into a pool slot.
 struct ggml_webgpu_paged_load {
     webgpu_paged_tensor * pg;
@@ -3685,9 +3703,139 @@ static void ggml_webgpu_paged_assign(webgpu_paged_tensor &                 pg,
     }
 }
 
+// Guessed experts read ahead on a worker thread into host memory. Slots change only when the routing asks for an
+// expert, so a wrong guess costs a read, never an eviction. Native only (the browser source reads on the worker's
+// own thread).
+struct ggml_webgpu_paged_readahead {
+    std::vector<std::pair<const webgpu_paged_tensor *, uint32_t>> keys;
+    std::vector<std::vector<uint8_t>>                              bytes;
+    std::future<void>                                              done;
+
+    void wait() {
+        if (done.valid()) {
+            done.wait();
+        }
+    }
+
+    ~ggml_webgpu_paged_readahead() { wait(); }
+};
+
+static void ggml_webgpu_paged_read_ahead(ggml_webgpu_paged_readahead &              ra,
+                                         const std::vector<webgpu_paged_tensor *> & tensors,
+                                         const std::vector<uint32_t> &              experts) {
+    ra.wait();
+    ra.keys.clear();
+    ra.bytes.clear();
+    for (webgpu_paged_tensor * pg : tensors) {
+        const ggml_webgpu_page_source & src = pg->buft->source;
+        if (!pg->buft->has_source || (src.read_batch == nullptr && src.read == nullptr)) {
+            continue;
+        }
+        for (uint32_t e : experts) {
+            if (pg->slot_of[e] == WEBGPU_PAGED_ABSENT) {
+                ra.keys.push_back({ pg, e });
+                ra.bytes.emplace_back(pg->slab);
+            }
+        }
+    }
+    if (ra.keys.empty()) {
+        return;
+    }
+    g_paged_stats.prefetch_reads += ra.keys.size();
+    ra.done = std::async(std::launch::async, [&ra]() {
+        for (size_t first = 0; first < ra.keys.size();) {
+            size_t last = first + 1;
+            while (last < ra.keys.size() && ra.keys[last].first->buft == ra.keys[first].first->buft) {
+                last++;
+            }
+            const ggml_webgpu_page_source & src = ra.keys[first].first->buft->source;
+            std::vector<const char *>       names;
+            std::vector<size_t>             offsets, sizes;
+            std::vector<void *>             dsts;
+            for (size_t i = first; i < last; i++) {
+                names.push_back(ra.keys[i].first->name.c_str());
+                offsets.push_back((size_t) ra.keys[i].second * ra.keys[i].first->slab);
+                sizes.push_back(ra.keys[i].first->slab);
+                dsts.push_back(ra.bytes[i].data());
+            }
+            if (src.read_batch != nullptr) {
+                src.read_batch(src.user_data, names.size(), names.data(), offsets.data(), dsts.data(), sizes.data());
+            } else {
+                for (size_t k = 0; k < names.size(); k++) {
+                    src.read(src.user_data, names[k], offsets[k], dsts[k], sizes[k]);
+                }
+            }
+            first = last;
+        }
+    });
+}
+
+// Loads guessed experts early, into slots the last routing did not use (free first, then least recently used), so a
+// guess never evicts what the previous token routed to. Guessed slots get the oldest tick: a later routing evicts an
+// unused guess first.
+static void ggml_webgpu_paged_assign_guess(webgpu_paged_tensor &                 pg,
+                                           const std::vector<uint32_t> &         experts,
+                                           std::vector<ggml_webgpu_paged_load> & loads) {
+    for (uint32_t e : experts) {
+        if (pg.slot_of[e] != WEBGPU_PAGED_ABSENT) {
+            continue;
+        }
+        uint32_t slot = WEBGPU_PAGED_ABSENT;
+        for (uint32_t s = 0; s < pg.n_slots; s++) {
+            if (pg.expert_of[s] == WEBGPU_PAGED_ABSENT) {
+                slot = s;
+                break;
+            }
+            const bool this_guess = std::find(experts.begin(), experts.end(), pg.expert_of[s]) != experts.end();
+            if (!this_guess && pg.last_use[s] < pg.tick &&
+                (slot == WEBGPU_PAGED_ABSENT || pg.last_use[s] < pg.last_use[slot])) {
+                slot = s;
+            }
+        }
+        if (slot == WEBGPU_PAGED_ABSENT) {
+            return;  // every other slot holds the last routing
+        }
+        if (pg.expert_of[slot] != WEBGPU_PAGED_ABSENT) {
+            pg.slot_of[pg.expert_of[slot]] = WEBGPU_PAGED_ABSENT;
+        }
+        pg.slot_of[e]      = slot;
+        pg.expert_of[slot] = e;
+        pg.last_use[slot]  = 0;
+        loads.push_back({ &pg, e, slot });
+    }
+}
+
 // Brings every load's bytes into its slot. Per page source, in one call: upload_batch when the source has it (the
 // source writes the GPU buffers itself), else read_batch (or read) into staging and a queue write per expert.
-static void ggml_webgpu_paged_fill(webgpu_global_context & global_ctx, const std::vector<ggml_webgpu_paged_load> & loads) {
+static void ggml_webgpu_paged_fill(webgpu_global_context &                     global_ctx,
+                                   const std::vector<ggml_webgpu_paged_load> & all,
+                                   ggml_webgpu_paged_readahead *               ra = nullptr) {
+    const int64_t tfill = ggml_time_us();
+    // loads a read-ahead already holds: wait for it, upload from its bytes
+    std::vector<ggml_webgpu_paged_load> loads;
+    for (const ggml_webgpu_paged_load & l : all) {
+        size_t k = SIZE_MAX;
+        if (ra != nullptr) {
+            for (size_t i = 0; i < ra->keys.size(); i++) {
+                if (ra->keys[i].first == l.pg && ra->keys[i].second == l.expert) {
+                    k = i;
+                    break;
+                }
+            }
+        }
+        if (k == SIZE_MAX) {
+            loads.push_back(l);
+            continue;
+        }
+        const int64_t tw = ggml_time_us();
+        ra->wait();
+        g_paged_stats.prefetch_wait_us += ggml_time_us() - tw;
+        global_ctx->queue.WriteBuffer(l.pg->pool, (size_t) l.slot * l.pg->slab, ra->bytes[k].data(), l.pg->slab);
+        g_paged_stats.prefetch_used++;
+        g_paged_stats.loads++;
+        g_paged_stats.load_bytes += l.pg->slab;
+    }
+
     const int64_t        t0 = ggml_time_us();
     std::vector<uint8_t> staging;
     std::vector<size_t>  staged(loads.size(), SIZE_MAX);  // offset in staging, per load read on the CPU
@@ -3752,6 +3900,7 @@ static void ggml_webgpu_paged_fill(webgpu_global_context & global_ctx, const std
     }
     g_paged_stats.read_us += t1 - t0;
     g_paged_stats.upload_us += ggml_time_us() - t1;
+    g_paged_stats.fill_us += ggml_time_us() - tfill;
 }
 
 // Uploads the slot map. With `only`, every expert but `experts` is marked absent, so one pass of a split MUL_MAT_ID
@@ -3778,6 +3927,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     webgpu_context                ctx         = backend_ctx->webgpu_ctx;
 
     WEBGPU_CPU_PROFILE_TOTAL_START(graph_compute);
+    const int64_t t_compute = ggml_time_us();
 
     std::vector<webgpu_encoded_op> commands;
 
@@ -3828,6 +3978,30 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     const ggml_tensor *                       paged_ids_tensor = nullptr;
     std::vector<uint32_t>                     paged_needed;
     std::vector<const webgpu_paged_tensor *>  paged_ready;  // resident for paged_ids_tensor, maps uploaded
+    std::unordered_map<int, const ggml_tensor *> paged_preds;  // layer -> its guess of the next layer's experts
+    ggml_webgpu_paged_guess                   paged_guess;
+    std::unordered_map<int, std::vector<webgpu_paged_tensor *>> paged_layers;  // layer -> paged tensors it routes
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (strncmp(n->name, "ffn_moe_pred-", 13) == 0 && n->ne[1] == 1) {
+            paged_preds[ggml_webgpu_paged_layer(n->name)] = n;
+        }
+        webgpu_paged_tensor * pg = n->op == GGML_OP_MUL_MAT_ID ? ggml_webgpu_paged(n->src[0]) : nullptr;
+        if (pg) {
+            auto & v = paged_layers[ggml_webgpu_paged_layer(n->src[2]->name)];
+            if (std::find(v.begin(), v.end(), pg) == v.end()) {
+                v.push_back(pg);
+            }
+        }
+    }
+#ifndef __EMSCRIPTEN__
+    static const bool             paged_read_ahead = !getenv("GGML_WEBGPU_PAGED_PREFETCH") || atoi(getenv("GGML_WEBGPU_PAGED_PREFETCH"));
+#else
+    static const bool             paged_read_ahead = false;
+#endif
+    ggml_webgpu_paged_readahead   paged_ra[2];  // by layer parity: the read for layer il + 1 runs while il fills from its own
+    int                           paged_layer = -1;
+    bool                          paged_guess_done = false;  // guessed experts loaded for the layer about to route
 
     while (node_idx < cgraph->n_nodes) {
         if (cgraph->nodes[node_idx]->op == GGML_OP_SET_ROWS) {
@@ -3846,6 +4020,18 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                 const int64_t tf0 = ggml_time_us();
                 flush_batch();
                 const int64_t tf1 = ggml_time_us();
+                // while the GPU runs what was just submitted, bring this layer's guessed experts in
+                if (paged_ids_tensor != node->src[2] && paged_guess.layer >= 0 &&
+                    paged_guess.layer == ggml_webgpu_paged_layer(node->src[2]->name)) {
+                    std::vector<ggml_webgpu_paged_load> loads;
+                    for (webgpu_paged_tensor * pg : paged_layers[paged_guess.layer]) {
+                        ggml_webgpu_paged_assign_guess(*pg, paged_guess.experts, loads);
+                    }
+                    g_paged_stats.guess_loads += loads.size();
+                    ggml_webgpu_paged_fill(ctx->global_ctx, loads, &paged_ra[paged_guess.layer & 1]);
+                    paged_guess.layer = -1;  // loaded; the routing below counts what it covered
+                    paged_guess_done  = true;
+                }
                 if (ggml_webgpu_paged_stats_level() >= 2) {
                     ggml_backend_webgpu_wait_queue(ctx->global_ctx);  // split GPU work from the readback round trip
                 }
@@ -3855,6 +4041,40 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                     paged_needed     = ggml_webgpu_paged_needed_experts(node->src[2], paged->n_expert);
                     paged_ids_tensor = node->src[2];
                     paged_ready.clear();
+
+                    const int layer = ggml_webgpu_paged_layer(node->src[2]->name);
+                    paged_layer     = layer;
+                    if (paged_guess_done) {
+                        // misses the guess covered: experts sitting in a guessed slot (tick 0)
+                        paged_guess_done = false;
+                        g_paged_stats.pred_layers++;
+                        for (uint32_t e : paged_needed) {
+                            if (paged->slot_of[e] != WEBGPU_PAGED_ABSENT && paged->last_use[paged->slot_of[e]] == 0) {
+                                g_paged_stats.guess_used++;
+                            }
+                        }
+                    } else if (paged_guess.layer == layer && layer >= 0) {
+                        g_paged_stats.pred_layers++;
+                        for (uint32_t e : paged_needed) {
+                            if (paged->slot_of[e] == WEBGPU_PAGED_ABSENT) {
+                                g_paged_stats.pred_misses++;
+                                if (std::find(paged_guess.experts.begin(), paged_guess.experts.end(), e) !=
+                                    paged_guess.experts.end()) {
+                                    g_paged_stats.pred_covered++;
+                                }
+                            }
+                        }
+                    }
+                    paged_guess = {};
+                    auto pred   = paged_preds.find(layer);
+                    if (pred != paged_preds.end()) {
+                        paged_guess.layer   = layer + 1;
+                        paged_guess.experts = ggml_webgpu_paged_needed_experts(pred->second, paged->n_expert);
+                        auto next = paged_layers.find(layer + 1);
+                        if (paged_read_ahead && next != paged_layers.end()) {
+                            ggml_webgpu_paged_read_ahead(paged_ra[(layer + 1) & 1], next->second, paged_guess.experts);
+                        }
+                    }
                 }
             }
             const bool split = paged_needed.size() > paged->n_slots;
@@ -3875,7 +4095,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                 for (webgpu_paged_tensor * pg : group) {
                     ggml_webgpu_paged_assign(*pg, paged_needed, loads);
                 }
-                ggml_webgpu_paged_fill(ctx->global_ctx, loads);
+                ggml_webgpu_paged_fill(ctx->global_ctx, loads, paged_layer >= 0 ? &paged_ra[paged_layer & 1] : nullptr);
                 for (webgpu_paged_tensor * pg : group) {
                     ggml_webgpu_paged_upload_map(ctx->global_ctx, *pg, paged_needed, false);
                     paged_ready.push_back(pg);
@@ -3976,13 +4196,32 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         ggml_backend_webgpu_check_set_rows(ctx, num_inflight_batches);
     }
 
+    if (paged_ids_tensor != nullptr) {
+        g_paged_stats.compute_us += ggml_time_us() - t_compute;
+    }
     if (paged_ids_tensor != nullptr && ggml_webgpu_paged_stats_level() >= 1 && ++g_paged_stats.graphs % 32 == 0) {
         const ggml_webgpu_paged_stats & st = g_paged_stats;
+        GGML_LOG_INFO("ggml_webgpu paged: per graph %.1f ms: fills %.1f, readback waits %.1f (flush + gpu + round trip)\n",
+                      st.compute_us / 1e3 / st.graphs, st.fill_us / 1e3 / st.graphs,
+                      (st.flush_us + st.gpu_wait_us + st.readback_us) / 1e3 / st.graphs);
         GGML_LOG_INFO("ggml_webgpu paged: %lld graphs, %lld readbacks (flush %.2f + gpu %.2f + round trip %.2f ms avg), %lld expert loads (%.1f MB, read %.2f ms avg, upload %.2f ms avg)\n",
                       (long long) st.graphs, (long long) st.readbacks, st.readbacks ? st.flush_us / 1e3 / st.readbacks : 0.0,
                       st.readbacks ? st.gpu_wait_us / 1e3 / st.readbacks : 0.0, st.readbacks ? st.readback_us / 1e3 / st.readbacks : 0.0,
                       (long long) st.loads, st.load_bytes / 1e6, st.loads ? st.read_us / 1e3 / st.loads : 0.0,
                       st.loads ? st.upload_us / 1e3 / st.loads : 0.0);
+        if (st.guess_loads > 0) {
+            GGML_LOG_INFO("ggml_webgpu paged: guesses loaded early %lld, routed to %lld (first tensor of each layer)\n",
+                          (long long) st.guess_loads, (long long) st.guess_used);
+        }
+        if (st.pred_layers > 0) {
+            GGML_LOG_INFO("ggml_webgpu paged: lookahead at %lld layers: %lld misses, %lld guessed (%.1f%%)\n",
+                          (long long) st.pred_layers, (long long) st.pred_misses, (long long) st.pred_covered,
+                          st.pred_misses ? 100.0 * st.pred_covered / st.pred_misses : 0.0);
+            GGML_LOG_INFO("ggml_webgpu paged: read ahead %lld experts, %lld routed to (%.1f%%), wait %.2f ms per routed\n",
+                          (long long) st.prefetch_reads, (long long) st.prefetch_used,
+                          st.prefetch_reads ? 100.0 * st.prefetch_used / st.prefetch_reads : 0.0,
+                          st.prefetch_used ? st.prefetch_wait_us / 1e3 / st.prefetch_used : 0.0);
+        }
     }
 
     WEBGPU_CPU_PROFILE_TOTAL_END(graph_compute, ctx->global_ctx);
