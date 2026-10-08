@@ -315,19 +315,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             // custom MoE logits calculation (router operates on attn_out, not cur)
             ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
             tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
-
-            // LLAMA_MOE_LOOKAHEAD=<k>: the next MoE layer's router on this layer's input, its top k as
-            // "ffn_moe_pred-<il>", a guess of the next layer's experts for a backend that pages them in
-            static const int n_lookahead = getenv("LLAMA_MOE_LOOKAHEAD") ? atoi(getenv("LLAMA_MOE_LOOKAHEAD")) : 0;
-            if (n_lookahead > 0 && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
-                ggml_tensor * next = ggml_mul(ctx0, tmp, model.layers[il + 1].ffn_gate_inp_s);
-                next = build_lora_mm(model.layers[il + 1].ffn_gate_inp, next);
-                next = ggml_argsort_top_k(ctx0, next, std::min<int>(n_lookahead, n_expert));
-                cb(next, "ffn_moe_pred", il);
-                ggml_set_output(next);  // nothing consumes it; keep it for the readback
-                ggml_build_forward_expand(gf, next);
-            }
-
             tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
