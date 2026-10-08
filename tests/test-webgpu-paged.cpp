@@ -137,6 +137,11 @@ int main() {
             }
         }
     }
+    // K-quants (most published GGUFs): decode and a prefill with passes
+    for (ggml_type type : { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        configs.push_back({ type, 16, 4, 1, 256, 64, 8, false });
+        configs.push_back({ type, 16, 4, 32, 256, 64, 3, false });
+    }
     configs.push_back({ GGML_TYPE_Q4_0, 128, 8, 1, 512, 96, 8, true });   // Qwen3-like routing, decode
     configs.push_back({ GGML_TYPE_Q4_0, 128, 8, 17, 512, 96, 20, true });  // prefill: passes
     configs.push_back({ GGML_TYPE_Q8_0, 128, 8, 64, 256, 64, 128, true }); // every expert resident
