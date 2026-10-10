@@ -202,6 +202,7 @@ struct webgpu_global_context_struct {
     webgpu_capabilities  capabilities;
     // Shared buffer to move data from device to host
     wgpu::Buffer         get_tensor_staging_buf;
+    wgpu::Buffer         paged_ids_staging_buf;  // ids readback of a paged MUL_MAT_ID, kept apart from get_tensor's
     // Global mutex for get_tensor
     std::recursive_mutex mutex;
 
@@ -224,6 +225,9 @@ struct webgpu_global_context_struct {
 #endif
 
     ~webgpu_global_context_struct() {
+        if (this->paged_ids_staging_buf) {
+            this->paged_ids_staging_buf.Destroy();
+        }
         if (this->get_tensor_staging_buf) {
             this->get_tensor_staging_buf.Destroy();
             this->get_tensor_staging_buf = nullptr;
@@ -372,6 +376,12 @@ static ggml_webgpu_paged_stats g_paged_stats;
 static int ggml_webgpu_paged_stats_level() {
     static const int level = getenv("GGML_WEBGPU_PAGED_STATS") ? atoi(getenv("GGML_WEBGPU_PAGED_STATS")) : 0;
     return level;
+}
+
+// GGML_WEBGPU_PAGED_HITPASS=0 turns off the decode hit pass (experiment toggle, remove before commit)
+static bool ggml_webgpu_paged_hitpass() {
+    static const bool on = !getenv("GGML_WEBGPU_PAGED_HITPASS") || atoi(getenv("GGML_WEBGPU_PAGED_HITPASS")) != 0;
+    return on;
 }
 
 static bool ggml_webgpu_buffer_is_paged(ggml_backend_buffer_t buffer) {
@@ -3603,12 +3613,41 @@ static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                   size_t                offset,
                                                   size_t                size);
 
-// The distinct experts a MUL_MAT_ID routes to: reads the ids tensor back ([n_expert_used, n_tokens], i32).
-static std::vector<uint32_t> ggml_webgpu_paged_needed_experts(const ggml_tensor * ids, uint32_t n_expert) {
-    const size_t         span = (ids->ne[1] - 1) * ids->nb[1] + ids->ne[0] * sizeof(int32_t);
+// The ids readback in two halves, so GPU work submitted between them (the hit pass) overlaps the round trip: submit
+// queues a copy of the ids tensor ([n_expert_used, n_tokens], i32) into a staging buffer; finish maps it, which waits
+// only for the copy's submission, and returns the distinct experts it routes to.
+static size_t ggml_webgpu_paged_ids_span(const ggml_tensor * ids) {
+    return (ids->ne[1] - 1) * ids->nb[1] + ids->ne[0] * sizeof(int32_t);
+}
+
+static void ggml_webgpu_paged_ids_submit(webgpu_global_context & global_ctx, const ggml_tensor * ids) {
+    const size_t offset = ggml_webgpu_tensor_offset(ids);
+    GGML_ASSERT(offset % 4 == 0);
+    const size_t size = ROUNDUP_POW2(ggml_webgpu_paged_ids_span(ids), 4);
+    if (!global_ctx->paged_ids_staging_buf || global_ctx->paged_ids_staging_buf.GetSize() < size) {
+        if (global_ctx->paged_ids_staging_buf) {
+            global_ctx->paged_ids_staging_buf.Destroy();
+        }
+        ggml_webgpu_create_buffer(global_ctx->device, global_ctx->paged_ids_staging_buf, std::max<size_t>(size, 1024),
+                                  wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead, "paged_ids_staging_buf");
+    }
+    auto *               buf_ctx = (ggml_backend_webgpu_buffer_context *) ids->buffer->context;
+    wgpu::CommandEncoder encoder = global_ctx->device.CreateCommandEncoder();
+    encoder.CopyBufferToBuffer(buf_ctx->buffer, offset, global_ctx->paged_ids_staging_buf, 0, size);
+    wgpu::CommandBuffer commands = encoder.Finish();
+    global_ctx->queue.Submit(1, &commands);
+}
+
+static std::vector<uint32_t> ggml_webgpu_paged_ids_finish(webgpu_global_context & global_ctx,
+                                                          const ggml_tensor *     ids,
+                                                          uint32_t                n_expert,
+                                                          int64_t                 t0) {
+    const size_t         span = ggml_webgpu_paged_ids_span(ids);
+    const size_t         size = ROUNDUP_POW2(span, 4);
     std::vector<int32_t> host(CEIL_DIV(span, sizeof(int32_t)));
-    const int64_t        t0 = ggml_time_us();
-    ggml_backend_webgpu_buffer_get_tensor(ids->buffer, ids, host.data(), 0, span);
+    ggml_backend_webgpu_map_buffer(global_ctx, global_ctx->paged_ids_staging_buf, wgpu::MapMode::Read, 0, size);
+    std::memcpy(host.data(), global_ctx->paged_ids_staging_buf.GetConstMappedRange(0, size), span);
+    global_ctx->paged_ids_staging_buf.Unmap();
     g_paged_stats.readbacks++;
     g_paged_stats.readback_us += ggml_time_us() - t0;
 
@@ -3828,6 +3867,7 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     const ggml_tensor *                       paged_ids_tensor = nullptr;
     std::vector<uint32_t>                     paged_needed;
     std::vector<const webgpu_paged_tensor *>  paged_ready;  // resident for paged_ids_tensor, maps uploaded
+    const webgpu_paged_tensor *               hit_pg = nullptr;  // the op of paged_ids_tensor that ran a hit pass
 
     while (node_idx < cgraph->n_nodes) {
         if (cgraph->nodes[node_idx]->op == GGML_OP_SET_ROWS) {
@@ -3852,12 +3892,32 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                 g_paged_stats.flush_us += tf1 - tf0;
                 g_paged_stats.gpu_wait_us += ggml_time_us() - tf1;
                 if (paged_ids_tensor != node->src[2]) {
-                    paged_needed     = ggml_webgpu_paged_needed_experts(node->src[2], paged->n_expert);
+                    const int64_t t0 = ggml_time_us();
+                    ggml_webgpu_paged_ids_submit(ctx->global_ctx, node->src[2]);
+                    // decode hit pass: while the ids come back, run this op on the experts already resident (the
+                    // kernel skips absent ones and writes nothing for them); the misses get their own pass below
+                    const bool hit = ggml_webgpu_paged_hitpass() && node->src[2]->ne[1] == 1 &&
+                                     paged->n_slots >= (uint32_t) node->src[2]->ne[0];
+                    hit_pg = hit ? paged : nullptr;
+                    if (hit) {
+                        ggml_webgpu_paged_upload_map(ctx->global_ctx, *paged, {}, false);
+                        if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
+                            commands.push_back(*cmd);
+                            num_batched_kernels += cmd.value().num_kernels;
+#ifdef GGML_WEBGPU_GPU_PROFILE
+                            profile_pipeline_names.insert(profile_pipeline_names.end(), cmd->pipeline_names.begin(),
+                                                          cmd->pipeline_names.end());
+#endif
+                        }
+                        flush_batch();
+                    }
+                    paged_needed     = ggml_webgpu_paged_ids_finish(ctx->global_ctx, node->src[2], paged->n_expert, t0);
                     paged_ids_tensor = node->src[2];
                     paged_ready.clear();
                 }
             }
             const bool split = paged_needed.size() > paged->n_slots;
+            std::vector<uint32_t> misses;  // experts of this op loaded after its hit pass
             if (!ready && !split) {
                 // this op and every later paged op routed by the same ids: assign slots, read all misses at once
                 std::vector<webgpu_paged_tensor *> group = { paged };
@@ -3876,12 +3936,29 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                     ggml_webgpu_paged_assign(*pg, paged_needed, loads);
                 }
                 ggml_webgpu_paged_fill(ctx->global_ctx, loads);
+                for (const ggml_webgpu_paged_load & l : loads) {
+                    if (l.pg == paged) {
+                        misses.push_back(l.expert);
+                    }
+                }
                 for (webgpu_paged_tensor * pg : group) {
-                    ggml_webgpu_paged_upload_map(ctx->global_ctx, *pg, paged_needed, false);
+                    // after a hit pass, this op's map lists only its misses, so the second pass computes just those
+                    ggml_webgpu_paged_upload_map(ctx->global_ctx, *pg, misses, pg == hit_pg);
                     paged_ready.push_back(pg);
                 }
             }
-            if (!split) {
+            if (!split && hit_pg == paged && !ready) {
+                if (!misses.empty()) {
+                    if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
+                        commands.push_back(*cmd);
+                        num_batched_kernels += cmd.value().num_kernels;
+#ifdef GGML_WEBGPU_GPU_PROFILE
+                        profile_pipeline_names.insert(profile_pipeline_names.end(), cmd->pipeline_names.begin(),
+                                                      cmd->pipeline_names.end());
+#endif
+                    }
+                }
+            } else if (!split) {
                 if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
                     commands.push_back(*cmd);
                     num_batched_kernels += cmd.value().num_kernels;
