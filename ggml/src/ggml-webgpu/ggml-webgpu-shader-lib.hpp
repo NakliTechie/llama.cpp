@@ -55,6 +55,8 @@
 #define WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG 4
 #define WEBGPU_MUL_MAT_VEC_LEGACY_Q_WG_SIZE        64
 #define WEBGPU_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG      4
+#define WEBGPU_MUL_MAT_VEC_Q6_K_WG_SIZE            64
+#define WEBGPU_MUL_MAT_VEC_Q6_K_OUTPUTS_PER_WG     8
 #define WEBGPU_MUL_MAT_ID_VEC_LEGACY_Q_WG_SIZE         64
 #define WEBGPU_MUL_MAT_ID_VEC_LEGACY_Q_OUTPUTS_PER_WG  8
 
@@ -2122,6 +2124,11 @@ class ggml_webgpu_shader_lib {
             outputs_per_wg = WEBGPU_MUL_MAT_VEC_LEGACY_Q_OUTPUTS_PER_WG;
         } else if (key.src0_type >= GGML_TYPE_Q2_K) {
             outputs_per_wg = WEBGPU_MUL_MAT_VEC_K_Q_OUTPUTS_PER_WG;
+            // measured on Q6_K (Gemma 4 26B-A4B): 64x8 cut the kernel ~10% vs 256x4; other K-quants unmeasured
+            if (key.src0_type == GGML_TYPE_Q6_K) {
+                wg_size        = WEBGPU_MUL_MAT_VEC_Q6_K_WG_SIZE;
+                outputs_per_wg = WEBGPU_MUL_MAT_VEC_Q6_K_OUTPUTS_PER_WG;
+            }
         } else if (key.src0_type >= GGML_TYPE_Q4_0) {
             // a narrower workgroup keeps more threads busy on the few blocks per row of a decode mat-vec;
             // measured on Q4_0 (Gemma 4 26B-A4B): 64x4 cut the kernel ~13% vs 256x4
