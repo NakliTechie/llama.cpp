@@ -32,7 +32,13 @@ struct MulMatIdVecParams {
 @group(0) @binding(3) var<storage, read_write> dst: array<f32>;   // [rows, n_expert_used, n_tokens(1)]
 
 // "mul_mat_vec_acc.tmpl" requires params.k, params.m, params.stride_01
+#ifdef PAGED
+// expert -> slot in the paged pool (src0 holds n_slots experts); 0xFFFFFFFF = not resident in this pass
+@group(0) @binding(4) var<storage, read_write> slot_map: array<u32>;   // [n_expert]
+@group(0) @binding(5) var<uniform> params: MulMatIdVecParams;
+#else
 @group(0) @binding(4) var<uniform> params: MulMatIdVecParams;
+#endif
 
 // Flattened as [row][thread] to keep each row's reduction contiguous in memory.
 var<workgroup> partial_sums: array<f32, OUTPUTS_PER_WG * WG_SIZE>;
@@ -68,6 +74,11 @@ fn main(
     // gather the selected experts for the target token.
     for (var col = thread_id;col < params.n_expert_used;col += WG_SIZE) {
         let expert = ids[params.offset_ids + col];
+#ifdef PAGED
+        if (slot_map[expert] == 0xFFFFFFFFu) {
+            continue;
+        }
+#endif
         gathered_count_ids[expert] = 1;
         gathered_expert_used[expert] = col;
     }
@@ -80,12 +91,19 @@ fn main(
     var own_expert:u32 = 0;
     var wg_in_batch:u32 = 0;
     var wg_sum:u32 = 0;
+#ifdef PAGED
+    // the host dispatches for every used expert; with some absent, the extra workgroups find none and write nothing
+    var found = false;
+#endif
 
     for (var i = 0u;i < params.n_expert;i += 1) {
         let wg_vec_count = gathered_count_ids[i]; // 1 or 0
         let wg_per_matrix = output_groups * wg_vec_count;
         if (wg_sum <= wg_linear && wg_linear < wg_sum + wg_per_matrix) {
             own_expert = i;
+#ifdef PAGED
+            found = true;
+#endif
             wg_in_batch = wg_linear - wg_sum;
             break;
         }
@@ -95,7 +113,11 @@ fn main(
     let row_base = (wg_linear % output_groups) * OUTPUTS_PER_WG;
     let dst1_stride = params.m;
 
+#ifdef PAGED
+    let src0_batch_offset = params.offset_src0 + select(0u, slot_map[own_expert], found) * params.stride_02;
+#else
     let src0_batch_offset = params.offset_src0 + own_expert * params.stride_02;
+#endif
     let src1_idx_base = params.offset_src1 + (gathered_expert_used[own_expert] % params.b_ne1) * params.stride_11;
     let dst_idx_base = params.offset_dst + gathered_expert_used[own_expert] * dst1_stride + row_base;
 
@@ -119,7 +141,13 @@ fn main(
         }
         let row_total = subgroupAdd(row_acc);
         if (subgroup_invocation_id == 0) {
+#ifdef PAGED
+            if (found) {
+                dst[dst_idx_base + row] = row_total;
+            }
+#else
             dst[dst_idx_base + row] = row_total;
+#endif
         }
     }
 #endif
@@ -147,7 +175,13 @@ fn main(
     if (thread_id < OUTPUTS_PER_WG) {
         let output_row = row_base + thread_id;
         if (output_row < params.m) {
+#ifdef PAGED
+            if (found) {
+                dst[dst_idx_base + thread_id] = partial_sums[partial_index(thread_id, 0)];
+            }
+#else
             dst[dst_idx_base + thread_id] = partial_sums[partial_index(thread_id, 0)];
+#endif
         }
     }
 #endif
