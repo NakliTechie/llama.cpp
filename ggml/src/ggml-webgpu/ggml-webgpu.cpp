@@ -16,6 +16,7 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -29,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -316,17 +318,60 @@ struct ggml_backend_webgpu_context {
     std::string    name;
 };
 
+#define WEBGPU_PAGED_ABSENT 0xFFFFFFFFu
+
+struct ggml_webgpu_paged_buft_context {
+    uint32_t                       n_slots;
+    bool                           has_source;
+    struct ggml_webgpu_page_source source;
+};
+
+// A paged expert tensor [ne0, ne1, n_expert]: a GPU pool of n_slots experts and a slot map read by the shaders.
+struct webgpu_paged_tensor {
+    std::string                      name;
+    ggml_webgpu_paged_buft_context * buft = nullptr;
+    wgpu::Buffer                     pool;      // n_slots * slab bytes
+    wgpu::Buffer                     slot_map;  // n_expert u32: expert -> slot, WEBGPU_PAGED_ABSENT when not resident
+    size_t                           slab     = 0;  // bytes per expert (nb[2])
+    uint32_t                         n_expert = 0;
+    uint32_t                         n_slots  = 0;
+    uint64_t                         tick     = 0;
+    std::vector<uint32_t>            slot_of;    // host mirror of slot_map
+    std::vector<uint32_t>            expert_of;  // slot -> expert, WEBGPU_PAGED_ABSENT when free
+    std::vector<uint64_t>            last_use;   // slot -> tick of its last use
+    std::vector<uint8_t>             ram;        // the expert bytes when the buffer type has no page source
+};
+
 // Per-thread data related to buffers
 struct ggml_backend_webgpu_buffer_context {
     wgpu::Buffer          buffer;
     std::string           label;
     webgpu_global_context global_ctx;
 
+    // set for a paged buffer: `buffer` stays null and every tensor gets its own pool
+    ggml_webgpu_paged_buft_context *                                              paged = nullptr;
+    std::unordered_map<const ggml_tensor *, std::unique_ptr<webgpu_paged_tensor>> pages;
+
     ggml_backend_webgpu_buffer_context(wgpu::Buffer buf, std::string lbl, webgpu_global_context global_ctx_) :
         buffer(std::move(buf)),
         label(std::move(lbl)),
         global_ctx(std::move(global_ctx_)) {}
 };
+
+static bool ggml_webgpu_buffer_is_paged(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && buffer->context != nullptr &&
+           ((ggml_backend_webgpu_buffer_context *) buffer->context)->paged != nullptr;
+}
+
+// The paged record of a tensor, or nullptr when it lives in an ordinary buffer.
+static webgpu_paged_tensor * ggml_webgpu_paged(const ggml_tensor * tensor) {
+    if (tensor == nullptr || !ggml_webgpu_buffer_is_paged(tensor->buffer)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_webgpu_buffer_context *) tensor->buffer->context;
+    auto   it  = ctx->pages.find(tensor->view_src ? tensor->view_src : tensor);
+    return it == ctx->pages.end() ? nullptr : it->second.get();
+}
 
 /* WebGPU object initializations */
 
@@ -370,6 +415,9 @@ static void ggml_webgpu_create_buffer(wgpu::Device &    device,
 }
 
 static wgpu::Buffer ggml_webgpu_tensor_buf(const ggml_tensor * tensor) {
+    if (webgpu_paged_tensor * pg = ggml_webgpu_paged(tensor)) {
+        return pg->pool;
+    }
     ggml_backend_webgpu_buffer_context * ctx = (ggml_backend_webgpu_buffer_context *) tensor->buffer->context;
     return ctx->buffer;
 }
@@ -378,6 +426,9 @@ static wgpu::Buffer ggml_webgpu_tensor_buf(const ggml_tensor * tensor) {
 // distance to the tensor is a whole number of type blocks, so shaders can index the
 // misalignment in elements even for block quantized types.
 static size_t ggml_webgpu_tensor_align_offset(const ggml_tensor * t, size_t alignment) {
+    if (ggml_webgpu_paged(t)) {
+        return 0;  // a paged tensor binds its own pool from the start
+    }
     const size_t offset    = ggml_webgpu_tensor_offset(t);
     const size_t type_size = ggml_type_size(t->type);
     size_t       aligned   = offset & ~(alignment - 1);
@@ -389,6 +440,9 @@ static size_t ggml_webgpu_tensor_align_offset(const ggml_tensor * t, size_t alig
 }
 
 static size_t ggml_webgpu_tensor_misalignment(const ggml_tensor * t, size_t alignment) {
+    if (ggml_webgpu_paged(t)) {
+        return 0;
+    }
     return ggml_webgpu_tensor_offset(t) - ggml_webgpu_tensor_align_offset(t, alignment);
 }
 
@@ -401,6 +455,9 @@ static size_t ggml_webgpu_tensor_align_offset(webgpu_context & ctx, const ggml_t
 }
 
 static size_t ggml_webgpu_tensor_binding_size(const ggml_tensor * t, size_t alignment) {
+    if (webgpu_paged_tensor * pg = ggml_webgpu_paged(t)) {
+        return pg->pool.GetSize();
+    }
     return ROUNDUP_POW2(ggml_nbytes(t) + ggml_webgpu_tensor_misalignment(t, alignment),
                         WEBGPU_STORAGE_BUF_BINDING_MULT);
 }
@@ -1764,14 +1821,16 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
                                                     ggml_tensor *    src1,
                                                     ggml_tensor *    src2,
                                                     ggml_tensor *    dst) {
-    const uint32_t param_n_expert      = (uint32_t) src0->ne[2];
-    const uint32_t param_n_expert_used = (uint32_t) dst->ne[1];
+    const uint32_t        param_n_expert      = (uint32_t) src0->ne[2];
+    const uint32_t        param_n_expert_used = (uint32_t) dst->ne[1];
+    webgpu_paged_tensor * paged               = ggml_webgpu_paged(src0);
 
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
     shader_lib_ctx.src0                           = src0;
     shader_lib_ctx.src1                           = src1;
     shader_lib_ctx.src2                           = src2;
     shader_lib_ctx.dst                            = dst;
+    shader_lib_ctx.src0_paged                     = paged != nullptr;
     shader_lib_ctx.supports_subgroups             = ctx->global_ctx->capabilities.supports_subgroups;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
 
@@ -1803,6 +1862,9 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
         ggml_webgpu_make_bind_group_entry(3, ggml_webgpu_tensor_buf(dst), ggml_webgpu_tensor_align_offset(ctx, dst),
                                           ggml_webgpu_tensor_binding_size(ctx, dst)),
     };
+    if (paged) {
+        entries.push_back(ggml_webgpu_make_bind_group_entry(4, paged->slot_map, 0, paged->slot_map.GetSize()));
+    }
 
     uint32_t wg_x = 1;
     uint32_t wg_y = 1;
@@ -1840,11 +1902,14 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
         return ggml_webgpu_mul_mat_id_vec(ctx, src0, src1, src2, dst);
     }
 
+    webgpu_paged_tensor * paged = ggml_webgpu_paged(src0);
+
     ggml_webgpu_shader_lib_context shader_lib_ctx = {};
     shader_lib_ctx.src0                           = src0;
     shader_lib_ctx.src1                           = src1;
     shader_lib_ctx.src2                           = src2;
     shader_lib_ctx.dst                            = dst;
+    shader_lib_ctx.src0_paged                     = paged != nullptr;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
 
     // Get or create pipeline
@@ -1889,6 +1954,9 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
         ggml_webgpu_make_bind_group_entry(1, ggml_webgpu_tensor_buf(dst), ids_cache_align_offset, ids_cache_bind_size),
         ggml_webgpu_make_bind_group_entry(2, ggml_webgpu_tensor_buf(dst), ids_tiles_align_offset, ids_tiles_bind_size),
     };
+    if (paged) {
+        gather_entries.push_back(ggml_webgpu_make_bind_group_entry(3, paged->slot_map, 0, paged->slot_map.GetSize()));
+    }
 
     dispatches.push_back({
         gather_pipeline, std::move(gather_params), std::move(gather_entries), { 1, 1 }
@@ -1922,6 +1990,9 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
         ggml_webgpu_make_bind_group_entry(3, ggml_webgpu_tensor_buf(dst), ids_cache_align_offset, ids_cache_bind_size),
         ggml_webgpu_make_bind_group_entry(4, ggml_webgpu_tensor_buf(dst), ids_tiles_align_offset, ids_tiles_bind_size),
     };
+    if (paged) {
+        main_entries.push_back(ggml_webgpu_make_bind_group_entry(5, paged->slot_map, 0, paged->slot_map.GetSize()));
+    }
 
     // Calculate workgroup dimensions
     uint32_t wg_x = 1;
@@ -3555,6 +3626,147 @@ static void ggml_backend_webgpu_check_set_rows(webgpu_context & ctx, uint32_t & 
 #endif
 }
 
+static void ggml_backend_webgpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                  const ggml_tensor *   tensor,
+                                                  void *                data,
+                                                  size_t                offset,
+                                                  size_t                size);
+
+// The distinct experts a MUL_MAT_ID routes to: reads the ids tensor back ([n_expert_used, n_tokens], i32).
+static std::vector<uint32_t> ggml_webgpu_paged_needed_experts(const ggml_tensor * ids, uint32_t n_expert) {
+    const size_t         span = (ids->ne[1] - 1) * ids->nb[1] + ids->ne[0] * sizeof(int32_t);
+    std::vector<int32_t> host(CEIL_DIV(span, sizeof(int32_t)));
+    ggml_backend_webgpu_buffer_get_tensor(ids->buffer, ids, host.data(), 0, span);
+
+    std::vector<uint8_t>  seen(n_expert, 0);
+    std::vector<uint32_t> needed;
+    for (int64_t t = 0; t < ids->ne[1]; t++) {
+        const int32_t * row = host.data() + t * (ids->nb[1] / sizeof(int32_t));
+        for (int64_t k = 0; k < ids->ne[0]; k++) {
+            const int32_t e = row[k];
+            GGML_ASSERT(e >= 0 && (uint32_t) e < n_expert);
+            if (!seen[e]) {
+                seen[e] = 1;
+                needed.push_back((uint32_t) e);
+            }
+        }
+    }
+    return needed;
+}
+
+// One expert to bring into a pool slot.
+struct ggml_webgpu_paged_load {
+    webgpu_paged_tensor * pg;
+    uint32_t              expert;
+    uint32_t              slot;
+};
+
+// Picks slots for `experts` (at most n_slots of them): hits are pinned for this op, misses take a free slot or the least
+// recently used one this op does not need. Appends the misses to `loads`; reads nothing yet.
+static void ggml_webgpu_paged_assign(webgpu_paged_tensor &                 pg,
+                                     const std::vector<uint32_t> &         experts,
+                                     std::vector<ggml_webgpu_paged_load> & loads) {
+    GGML_ASSERT(experts.size() <= pg.n_slots);
+    const uint64_t tick = ++pg.tick;
+    for (uint32_t e : experts) {
+        if (pg.slot_of[e] != WEBGPU_PAGED_ABSENT) {
+            pg.last_use[pg.slot_of[e]] = tick;
+        }
+    }
+    for (uint32_t e : experts) {
+        if (pg.slot_of[e] != WEBGPU_PAGED_ABSENT) {
+            continue;
+        }
+        uint32_t slot = WEBGPU_PAGED_ABSENT;
+        for (uint32_t s = 0; s < pg.n_slots; s++) {
+            if (pg.expert_of[s] == WEBGPU_PAGED_ABSENT) {
+                slot = s;
+                break;
+            }
+            if (pg.last_use[s] != tick && (slot == WEBGPU_PAGED_ABSENT || pg.last_use[s] < pg.last_use[slot])) {
+                slot = s;
+            }
+        }
+        GGML_ASSERT(slot != WEBGPU_PAGED_ABSENT);
+        if (pg.expert_of[slot] != WEBGPU_PAGED_ABSENT) {
+            pg.slot_of[pg.expert_of[slot]] = WEBGPU_PAGED_ABSENT;
+        }
+        pg.slot_of[e]      = slot;
+        pg.expert_of[slot] = e;
+        pg.last_use[slot]  = tick;
+        loads.push_back({ &pg, e, slot });
+    }
+}
+
+// Copies each load's expert into its slot: one read_batch (or n reads) per page source, then a queue write per expert.
+static void ggml_webgpu_paged_fill(webgpu_global_context &                     global_ctx,
+                                   const std::vector<ggml_webgpu_paged_load> & loads) {
+    std::vector<uint8_t> staging;
+    std::vector<size_t>  staged(loads.size(), 0);  // offset of each load in staging
+
+    for (size_t first = 0; first < loads.size();) {
+        // [first, last): consecutive loads of one buffer type, so one page source
+        size_t last = first + 1;
+        while (last < loads.size() && loads[last].pg->buft == loads[first].pg->buft) {
+            last++;
+        }
+        ggml_webgpu_paged_buft_context * buft = loads[first].pg->buft;
+        if (buft->has_source) {
+            std::vector<const char *> names;
+            std::vector<size_t>       offsets, sizes;
+            std::vector<void *>       dsts;
+            for (size_t i = first; i < last; i++) {
+                staged[i] = staging.size();
+                staging.resize(staging.size() + loads[i].pg->slab);
+            }
+            for (size_t i = first; i < last; i++) {
+                names.push_back(loads[i].pg->name.c_str());
+                offsets.push_back((size_t) loads[i].expert * loads[i].pg->slab);
+                sizes.push_back(loads[i].pg->slab);
+                dsts.push_back(staging.data() + staged[i]);
+            }
+            const ggml_webgpu_page_source & src = buft->source;
+            if (src.read_batch != nullptr) {
+                src.read_batch(src.user_data, names.size(), names.data(), offsets.data(), dsts.data(), sizes.data());
+            } else {
+                for (size_t k = 0; k < names.size(); k++) {
+                    src.read(src.user_data, names[k], offsets[k], dsts[k], sizes[k]);
+                }
+            }
+        }
+        first = last;
+    }
+
+    for (size_t i = 0; i < loads.size(); i++) {
+        const ggml_webgpu_paged_load & l   = loads[i];
+        const size_t                   dst = (size_t) l.slot * l.pg->slab;
+        if (l.pg->buft->has_source) {
+            global_ctx->queue.WriteBuffer(l.pg->pool, dst, staging.data() + staged[i], l.pg->slab);
+        } else {
+            const size_t offset = (size_t) l.expert * l.pg->slab;
+            GGML_ASSERT(l.pg->ram.size() >= offset + l.pg->slab);
+            global_ctx->queue.WriteBuffer(l.pg->pool, dst, l.pg->ram.data() + offset, l.pg->slab);
+        }
+    }
+}
+
+// Uploads the slot map. With `only`, every expert but `experts` is marked absent, so one pass of a split MUL_MAT_ID
+// computes exactly that subset.
+static void ggml_webgpu_paged_upload_map(webgpu_global_context &       global_ctx,
+                                         const webgpu_paged_tensor &   pg,
+                                         const std::vector<uint32_t> & experts,
+                                         bool                          only) {
+    if (only) {
+        std::vector<uint32_t> map(pg.n_expert, WEBGPU_PAGED_ABSENT);
+        for (uint32_t e : experts) {
+            map[e] = pg.slot_of[e];
+        }
+        global_ctx->queue.WriteBuffer(pg.slot_map, 0, map.data(), map.size() * sizeof(uint32_t));
+    } else {
+        global_ctx->queue.WriteBuffer(pg.slot_map, 0, pg.slot_of.data(), pg.slot_of.size() * sizeof(uint32_t));
+    }
+}
+
 static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_graph_compute(" << cgraph->n_nodes << " nodes)");
 
@@ -3581,10 +3793,38 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
         ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
     }
 
-    while (node_idx < cgraph->n_nodes) {
-        if (cgraph->nodes[node_idx]->op == GGML_OP_SET_ROWS) {
-            contains_set_rows = true;
+    // submits the current batch and opens the next one
+    auto flush_batch = [&]() {
+        if (ctx->active_compute_pass) {
+            ctx->active_compute_pass.End();
+            ctx->active_compute_pass = nullptr;
         }
+        if (num_batched_kernels > 0) {
+            wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
+            ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
+        }
+        num_batched_kernels = 0;
+
+        // reset state for next batch
+        ctx->active_command_encoder = ctx->global_ctx->device.CreateCommandEncoder();
+        if (ctx->batch_compute_passes) {
+            ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
+        }
+        ctx->param_arena.reset();
+        commands.clear();
+#ifdef GGML_WEBGPU_GPU_PROFILE
+        // flush before the next batch can overflow the QuerySet
+        if (ctx->profile_timestamp_query_count + 2 * ctx->global_ctx->command_submit_batch_size >=
+            WEBGPU_MAX_PROFILE_QUERY_COUNT) {
+            ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches);
+            // reset profile timestamp state
+            ctx->profile_timestamp_query_count = 0;
+            profile_pipeline_names.clear();
+        }
+#endif
+    };
+
+    auto encode_node = [&]() {
         if (auto cmd = ggml_webgpu_encode(ctx, cgraph, node_idx, num_encoded_ops)) {
             commands.push_back(*cmd);
             num_batched_kernels += cmd.value().num_kernels;
@@ -3593,32 +3833,81 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
                                           cmd->pipeline_names.end());
 #endif
         }
+    };
+
+    // gate, up and down experts share one ids tensor; they are paged in together at the first of them
+    const ggml_tensor *                      paged_ids = nullptr;
+    std::vector<uint32_t>                    paged_needed;
+    std::vector<const webgpu_paged_tensor *> paged_ready;
+
+    while (node_idx < cgraph->n_nodes) {
+        ggml_tensor * node = cgraph->nodes[node_idx];
+        if (node->op == GGML_OP_SET_ROWS) {
+            contains_set_rows = true;
+        }
+
+        webgpu_paged_tensor * paged = nullptr;
+        if (node->op == GGML_OP_MUL_MAT_ID && (node->flags & GGML_TENSOR_FLAG_COMPUTE) && !ggml_is_empty(node)) {
+            paged = ggml_webgpu_paged(node->src[0]);
+        }
+        if (paged) {
+            const ggml_tensor * ids = node->src[2];
+            const bool          ready =
+                paged_ids == ids && std::find(paged_ready.begin(), paged_ready.end(), paged) != paged_ready.end();
+            if (!ready) {
+                // the ids are computed on the GPU: submit everything before reading them back
+                flush_batch();
+                if (paged_ids != ids) {
+                    paged_needed = ggml_webgpu_paged_needed_experts(ids, paged->n_expert);
+                    paged_ids    = ids;
+                    paged_ready.clear();
+                }
+            }
+            if (paged_needed.size() > paged->n_slots) {
+                // more experts than slots: one pass per slot-sized subset, each writing disjoint outputs
+                for (size_t first = 0; first < paged_needed.size(); first += paged->n_slots) {
+                    const size_t                        last = std::min(paged_needed.size(), first + paged->n_slots);
+                    std::vector<uint32_t>               part(paged_needed.begin() + first, paged_needed.begin() + last);
+                    std::vector<ggml_webgpu_paged_load> loads;
+                    ggml_webgpu_paged_assign(*paged, part, loads);
+                    ggml_webgpu_paged_fill(ctx->global_ctx, loads);
+                    ggml_webgpu_paged_upload_map(ctx->global_ctx, *paged, part, true);
+                    encode_node();
+                    // the next pass overwrites slots this one reads
+                    flush_batch();
+                }
+                node_idx += num_encoded_ops;
+                num_encoded_ops = 1;
+                continue;
+            }
+            if (!ready) {
+                std::vector<webgpu_paged_tensor *> group = { paged };
+                for (int j = node_idx + 1; j < cgraph->n_nodes; j++) {
+                    const ggml_tensor * n = cgraph->nodes[j];
+                    if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == ids) {
+                        webgpu_paged_tensor * other = ggml_webgpu_paged(n->src[0]);
+                        if (other && other->n_slots >= paged_needed.size() &&
+                            std::find(group.begin(), group.end(), other) == group.end()) {
+                            group.push_back(other);
+                        }
+                    }
+                }
+                std::vector<ggml_webgpu_paged_load> loads;
+                for (webgpu_paged_tensor * pg : group) {
+                    ggml_webgpu_paged_assign(*pg, paged_needed, loads);
+                }
+                ggml_webgpu_paged_fill(ctx->global_ctx, loads);
+                for (webgpu_paged_tensor * pg : group) {
+                    ggml_webgpu_paged_upload_map(ctx->global_ctx, *pg, paged_needed, false);
+                    paged_ready.push_back(pg);
+                }
+            }
+        }
+
+        encode_node();
 
         if (num_batched_kernels >= ctx->global_ctx->command_submit_batch_size) {
-            if (ctx->active_compute_pass) {
-                ctx->active_compute_pass.End();
-            }
-            num_batched_kernels                = 0;
-            wgpu::CommandBuffer batch_commands = ctx->active_command_encoder.Finish();
-            ggml_backend_webgpu_submit_commands(ctx, batch_commands, num_inflight_batches);
-
-            // reset state for next batch
-            ctx->active_command_encoder = ctx->global_ctx->device.CreateCommandEncoder();
-            if (ctx->batch_compute_passes) {
-                ctx->active_compute_pass = ctx->active_command_encoder.BeginComputePass();
-            }
-            ctx->param_arena.reset();
-            commands.clear();
-#ifdef GGML_WEBGPU_GPU_PROFILE
-            // flush before the next batch can overflow the QuerySet
-            if (ctx->profile_timestamp_query_count + 2 * ctx->global_ctx->command_submit_batch_size >=
-                WEBGPU_MAX_PROFILE_QUERY_COUNT) {
-                ggml_backend_webgpu_collect_profile_results(ctx, profile_pipeline_names, num_inflight_batches);
-                // reset profile timestamp state
-                ctx->profile_timestamp_query_count = 0;
-                profile_pipeline_names.clear();
-            }
-#endif
+            flush_batch();
         }
 
         node_idx += num_encoded_ops;
@@ -4387,9 +4676,182 @@ static ggml_backend_buffer_type_t ggml_backend_webgpu_device_get_buffer_type(ggm
     return &ggml_backend_webgpu_buffer_type;
 }
 
+/* Paged expert buffers (see ggml_backend_webgpu_paged_buffer_type in ggml-webgpu.h) */
+
+static void ggml_backend_webgpu_paged_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * ctx = static_cast<ggml_backend_webgpu_buffer_context *>(buffer->context);
+    for (auto & it : ctx->pages) {
+        it.second->pool.Destroy();
+        it.second->slot_map.Destroy();
+    }
+    delete ctx;
+}
+
+// Called for every tensor placed in the buffer: allocate its pool and slot map, no storage for the full tensor.
+static enum ggml_status ggml_backend_webgpu_paged_buffer_init_tensor(ggml_backend_buffer_t buffer,
+                                                                     ggml_tensor *         tensor) {
+    if (tensor->view_src != nullptr) {
+        return GGML_STATUS_SUCCESS;
+    }
+    auto * ctx = static_cast<ggml_backend_webgpu_buffer_context *>(buffer->context);
+    GGML_ASSERT(ggml_is_contiguous(tensor) && tensor->ne[3] == 1);
+    GGML_ASSERT(tensor->nb[2] % 4 == 0);
+
+    auto pg       = std::make_unique<webgpu_paged_tensor>();
+    pg->name      = tensor->name;
+    pg->buft      = ctx->paged;
+    pg->slab      = tensor->nb[2];
+    pg->n_expert  = (uint32_t) tensor->ne[2];
+    pg->n_slots   = std::min(ctx->paged->n_slots, pg->n_expert);
+    pg->slot_of   = std::vector<uint32_t>(pg->n_expert, WEBGPU_PAGED_ABSENT);
+    pg->expert_of = std::vector<uint32_t>(pg->n_slots, WEBGPU_PAGED_ABSENT);
+    pg->last_use  = std::vector<uint64_t>(pg->n_slots, 0);
+
+    wgpu::Device & device = ctx->global_ctx->device;
+    ggml_webgpu_create_buffer(device, pg->pool, ROUNDUP_POW2(pg->n_slots * pg->slab, WEBGPU_STORAGE_BUF_BINDING_MULT),
+                              wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                              (std::string("paged_pool_") + tensor->name).c_str());
+    ggml_webgpu_create_buffer(device, pg->slot_map, pg->n_expert * sizeof(uint32_t),
+                              wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                              (std::string("paged_map_") + tensor->name).c_str());
+    ctx->global_ctx->queue.WriteBuffer(pg->slot_map, 0, pg->slot_of.data(), pg->slot_of.size() * sizeof(uint32_t));
+
+    ctx->pages[tensor] = std::move(pg);
+    return GGML_STATUS_SUCCESS;
+}
+
+// Model load: the bytes go to the page source (or host memory), never to the GPU.
+static void ggml_backend_webgpu_paged_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                        ggml_tensor *         tensor,
+                                                        const void *          data,
+                                                        size_t                offset,
+                                                        size_t                size) {
+    GGML_UNUSED(buffer);
+    webgpu_paged_tensor * pg = ggml_webgpu_paged(tensor);
+    GGML_ASSERT(pg != nullptr && tensor->view_src == nullptr);
+    if (pg->buft->has_source) {
+        const ggml_webgpu_page_source & src = pg->buft->source;
+        if (src.has == nullptr || !src.has(src.user_data, pg->name.c_str(), ggml_nbytes(tensor))) {
+            src.write(src.user_data, pg->name.c_str(), offset, data, size);
+        }
+        return;
+    }
+    if (pg->ram.size() < ggml_nbytes(tensor)) {
+        pg->ram.resize(ggml_nbytes(tensor));
+    }
+    memcpy(pg->ram.data() + offset, data, size);
+}
+
+static void ggml_backend_webgpu_paged_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                        const ggml_tensor *   tensor,
+                                                        void *                data,
+                                                        size_t                offset,
+                                                        size_t                size) {
+    GGML_UNUSED(buffer);
+    webgpu_paged_tensor * pg = ggml_webgpu_paged(tensor);
+    GGML_ASSERT(pg != nullptr && tensor->view_src == nullptr);
+    if (pg->buft->has_source) {
+        pg->buft->source.read(pg->buft->source.user_data, pg->name.c_str(), offset, data, size);
+        return;
+    }
+    GGML_ASSERT(pg->ram.size() >= offset + size);
+    memcpy(data, pg->ram.data() + offset, size);
+}
+
+static void ggml_backend_webgpu_paged_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+                                                           ggml_tensor *         tensor,
+                                                           uint8_t               value,
+                                                           size_t                offset,
+                                                           size_t                size) {
+    GGML_UNUSED(buffer);
+    webgpu_paged_tensor * pg = ggml_webgpu_paged(tensor);
+    GGML_ASSERT(pg != nullptr && !pg->buft->has_source);
+    if (pg->ram.size() < ggml_nbytes(tensor)) {
+        pg->ram.resize(ggml_nbytes(tensor));
+    }
+    memset(pg->ram.data() + offset, value, size);
+}
+
+static void ggml_backend_webgpu_paged_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(value);  // weights are written by set_tensor; nothing on the GPU to clear
+}
+
+static ggml_backend_buffer_i ggml_backend_webgpu_paged_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_webgpu_paged_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_webgpu_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_webgpu_paged_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_webgpu_paged_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_webgpu_paged_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_webgpu_paged_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_webgpu_paged_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+static const char * ggml_backend_webgpu_paged_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_WEBGPU_NAME "_Paged";
+}
+
+static ggml_backend_buffer_t ggml_backend_webgpu_paged_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+                                                                                size_t                     size) {
+    auto * dev_ctx = static_cast<ggml_backend_webgpu_device_context *>(buft->device->context);
+    auto * buf_ctx = new ggml_backend_webgpu_buffer_context(nullptr, "paged_buf", dev_ctx->webgpu_global_ctx);
+    buf_ctx->paged = static_cast<ggml_webgpu_paged_buft_context *>(buft->context);
+    return ggml_backend_buffer_init(buft, ggml_backend_webgpu_paged_buffer_interface, buf_ctx, size);
+}
+
+// Addresses in a paged buffer are only offsets (no GPU storage behind them); keep them inside 32 bits for wasm32.
+static size_t ggml_backend_webgpu_paged_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return (size_t) 1 << 31;
+}
+
+static size_t ggml_backend_webgpu_paged_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft,
+                                                                   const ggml_tensor *        tensor) {
+    GGML_UNUSED(buft);
+    return ggml_nbytes(tensor);
+}
+
+ggml_backend_buffer_type_t ggml_backend_webgpu_paged_buffer_type(ggml_backend_dev_t                     dev,
+                                                                 uint32_t                               n_slots,
+                                                                 const struct ggml_webgpu_page_source * source) {
+    GGML_ASSERT(n_slots > 0);
+    static std::mutex                                                   mutex;
+    static std::vector<std::unique_ptr<ggml_webgpu_paged_buft_context>> contexts;
+    static std::vector<std::unique_ptr<ggml_backend_buffer_type>>       bufts;
+    std::lock_guard<std::mutex>                                         lock(mutex);
+
+    auto ctx        = std::make_unique<ggml_webgpu_paged_buft_context>();
+    ctx->n_slots    = n_slots;
+    ctx->has_source = source != nullptr;
+    ctx->source     = source ? *source : ggml_webgpu_page_source{};
+    GGML_ASSERT(!ctx->has_source || (ctx->source.read != nullptr && ctx->source.write != nullptr));
+
+    const ggml_backend_buffer_type_i iface = {
+        /* .get_name         = */ ggml_backend_webgpu_paged_buffer_type_get_name,
+        /* .alloc_buffer     = */ ggml_backend_webgpu_paged_buffer_type_alloc_buffer,
+        /* .alloc_buffer_n   = */ NULL,
+        /* .get_alignment    = */ ggml_backend_webgpu_buffer_type_get_alignment,
+        /* .get_max_size     = */ ggml_backend_webgpu_paged_buffer_type_get_max_size,
+        /* .get_alloc_size   = */ ggml_backend_webgpu_paged_buffer_type_get_alloc_size,
+        /* .get_alloc_size_n = */ NULL,
+        /* .is_host          = */ NULL,
+    };
+    bufts.push_back(std::make_unique<ggml_backend_buffer_type>(ggml_backend_buffer_type{ iface, dev, ctx.get() }));
+    contexts.push_back(std::move(ctx));
+    return bufts.back().get();
+}
+
+/* End paged expert buffers */
+
 static bool ggml_backend_webgpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(dev);
-    return buft->iface.get_name == ggml_backend_webgpu_buffer_type_get_name;
+    return buft->iface.get_name == ggml_backend_webgpu_buffer_type_get_name ||
+           buft->iface.get_name == ggml_backend_webgpu_paged_buffer_type_get_name;
 }
 
 static bool ggml_webgpu_supported_qtype(ggml_type type) {
@@ -4429,9 +4891,23 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
     ggml_tensor * src1 = op->src[1];
     ggml_tensor * src2 = op->src[2];
 
+    // a paged tensor is only ever the expert weights (src0) of MUL_MAT_ID
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] != nullptr && ggml_webgpu_buffer_is_paged(op->src[i]->buffer) &&
+            (op->op != GGML_OP_MUL_MAT_ID || i != 0 || op->src[i]->view_src != nullptr ||
+             !ggml_is_contiguous(op->src[i]) || op->src[i]->nb[2] % 4 != 0)) {
+            return false;
+        }
+    }
+    if (ggml_webgpu_buffer_is_paged(op->buffer) && op->op != GGML_OP_NONE) {
+        return false;  // a paged buffer holds weights (graph leaves), never op results
+    }
+    const bool src0_paged = src0 != nullptr && ggml_webgpu_buffer_is_paged(src0->buffer);
+
     // on smaller devices (or CI), tensors may be larger than the max storage buffer size
+    // (a paged src0 binds only its pool)
     if (ggml_nbytes(op) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize ||
-        (src0 != nullptr &&
+        (src0 != nullptr && !src0_paged &&
          ggml_nbytes(src0) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize) ||
         (src1 != nullptr &&
          ggml_nbytes(src1) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize)) {
@@ -4848,6 +5324,14 @@ static size_t ggml_backend_webgpu_reg_get_device_count(ggml_backend_reg_t reg) {
     return ctx->device_count;
 }
 
+static void * ggml_backend_webgpu_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_webgpu_paged_buffer_type") == 0) {
+        return (void *) ggml_backend_webgpu_paged_buffer_type;
+    }
+    return nullptr;
+}
+
 // Only one device is supported for now
 static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     GGML_ASSERT(index == 0);
@@ -4878,7 +5362,7 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
     /* .get_name         = */ ggml_backend_webgpu_reg_get_name,
     /* .get_device_count = */ ggml_backend_webgpu_reg_get_device_count,
     /* .get_device       = */ ggml_backend_webgpu_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_webgpu_reg_get_proc_address,
 };
 
 /* End GGML Backend Registration Interface */

@@ -42,7 +42,13 @@ struct MulMatIdParams {
 @group(0) @binding(3) var<storage, read_write> ids_slot_pos: array<u32>; // [n_expert_used * n_tokens]
 @group(0) @binding(4) var<storage, read_write> ids_tiles: array<u32>; // [n_tiles, (expert, first slot, n slots) * n_tiles]
 
+#ifdef PAGED
+// expert -> slot in the paged pool (src0 holds n_slots experts); absent experts have no tiles
+@group(0) @binding(5) var<storage, read_write> slot_map: array<u32>; // [n_expert]
+@group(0) @binding(6) var<uniform> params: MulMatIdParams;
+#else
 @group(0) @binding(5) var<uniform> params: MulMatIdParams;
+#endif
 
 fn get_local_n(thread_id: u32) -> u32 {
     return thread_id / WORKGROUP_SIZE_M;
@@ -114,7 +120,11 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
             gathered_expert_used[i] = pos_in_ids % params.n_expert_used;
             gathered_tokens[i] = pos_in_ids / params.n_expert_used;
         }
+#ifdef PAGED
+        src0_batch_offset = params.offset_src0 + slot_map[expert_idx] * params.stride_02;
+#else
         src0_batch_offset = params.offset_src0 + expert_idx * params.stride_02;
+#endif
     }
 
     workgroupBarrier();

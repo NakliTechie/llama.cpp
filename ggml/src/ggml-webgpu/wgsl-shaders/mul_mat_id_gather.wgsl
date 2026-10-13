@@ -14,7 +14,13 @@ struct MulMatIdGatherParams {
 @group(0) @binding(1) var<storage, read_write> ids_slot_pos: array<u32>; // [n_expert_used * n_tokens]
 @group(0) @binding(2) var<storage, read_write> ids_tiles: array<u32>; // [n_tiles, (expert, first slot, n slots) * n_tiles]
 
+#ifdef PAGED
+// expert -> slot in the paged pool; 0xFFFFFFFF = not resident in this pass
+@group(0) @binding(3) var<storage, read_write> slot_map: array<u32>; // [n_expert]
+@group(0) @binding(4) var<uniform> params: MulMatIdGatherParams;
+#else
 @group(0) @binding(3) var<uniform> params: MulMatIdGatherParams;
+#endif
 
 // per expert: the slot count after the counting loop, replaced by the first slot of the expert in
 // ids_slot_pos by the prefix sum, and advanced as the write cursor of the expert in the store loop
@@ -39,6 +45,12 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
         let row = i / params.n_expert_used;
         let col = i % params.n_expert_used;
         let expert = u32(ids[params.offset_ids + row * params.stride_ids_1 + col]);
+#ifdef PAGED
+        // an expert not resident in this pass gets no slots, so no tile computes it
+        if (slot_map[expert] == 0xFFFFFFFFu) {
+            continue;
+        }
+#endif
         atomicAdd(&ids_count[expert], 1u);
     }
 
@@ -75,6 +87,11 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
         let row = i / params.n_expert_used;
         let col = i % params.n_expert_used;
         let expert = u32(ids[params.offset_ids + row * params.stride_ids_1 + col]);
+#ifdef PAGED
+        if (slot_map[expert] == 0xFFFFFFFFu) {
+            continue;
+        }
+#endif
         let pos = atomicAdd(&ids_count[expert], 1u);
         ids_slot_pos[pos] = i;
     }
