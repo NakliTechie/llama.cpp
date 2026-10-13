@@ -374,19 +374,62 @@ static int ggml_webgpu_paged_stats_level() {
     return level;
 }
 
+static const char * ggml_backend_webgpu_paged_buffer_type_get_name(ggml_backend_buffer_type_t buft);
+
+// Held by a paged graph from its first slot assignment until its last dispatch is submitted, and by writes to paged
+// tensors: contexts that share the weights also share the slots.
+static std::mutex g_paged_mutex;
+
+// By buffer type: the context of another backend's buffer is not ours to read.
 static bool ggml_webgpu_buffer_is_paged(ggml_backend_buffer_t buffer) {
-    return buffer != nullptr && buffer->context != nullptr &&
-           ((ggml_backend_webgpu_buffer_context *) buffer->context)->paged != nullptr;
+    return buffer != nullptr && buffer->buft != nullptr &&
+           buffer->buft->iface.get_name == ggml_backend_webgpu_paged_buffer_type_get_name;
 }
 
 // The paged record of a tensor, or nullptr when it lives in an ordinary buffer.
 static webgpu_paged_tensor * ggml_webgpu_paged(const ggml_tensor * tensor) {
-    if (tensor == nullptr || !ggml_webgpu_buffer_is_paged(tensor->buffer)) {
+    // a zero-size buffer (the loader's support probe) has a paged type but no context
+    if (tensor == nullptr || !ggml_webgpu_buffer_is_paged(tensor->buffer) || tensor->buffer->context == nullptr) {
         return nullptr;
     }
     auto * ctx = (ggml_backend_webgpu_buffer_context *) tensor->buffer->context;
     auto   it  = ctx->pages.find(tensor->view_src ? tensor->view_src : tensor);
     return it == ctx->pages.end() ? nullptr : it->second.get();
+}
+
+// Drops the resident experts in bytes [offset, offset + size) so their next use reads the new bytes.
+static void ggml_webgpu_paged_invalidate(const webgpu_global_context & global_ctx,
+                                         webgpu_paged_tensor &         pg,
+                                         size_t                        offset,
+                                         size_t                        size) {
+    bool changed = false;
+    for (uint64_t e = offset / pg.slab; e < pg.n_expert && e * pg.slab < (uint64_t) offset + size; e++) {
+        const uint32_t slot = pg.slot_of[e];
+        if (slot != WEBGPU_PAGED_ABSENT) {
+            pg.expert_of[slot] = WEBGPU_PAGED_ABSENT;
+            pg.slot_of[e]      = WEBGPU_PAGED_ABSENT;
+            changed            = true;
+        }
+    }
+    if (changed) {
+        global_ctx->queue.WriteBuffer(pg.slot_map, 0, pg.slot_of.data(), pg.slot_of.size() * sizeof(uint32_t));
+    }
+}
+
+// Writes `value` over bytes [offset, offset + size) of a paged tensor, in its page source or host copy.
+static void ggml_webgpu_paged_write_value(webgpu_paged_tensor & pg, uint8_t value, size_t offset, size_t size) {
+    if (pg.buft->has_source) {
+        const ggml_webgpu_page_source & src = pg.buft->source;
+        std::vector<uint8_t>            chunk(std::min<size_t>(size, (size_t) 1 << 20), value);
+        for (size_t done = 0; done < size; done += chunk.size()) {
+            src.write(src.user_data, pg.name.c_str(), offset + done, chunk.data(), std::min(chunk.size(), size - done));
+        }
+        return;
+    }
+    if (pg.ram.size() < offset + size) {
+        pg.ram.resize((size_t) pg.n_expert * pg.slab);
+    }
+    memset(pg.ram.data() + offset, value, size);
 }
 
 /* WebGPU object initializations */
@@ -3777,6 +3820,15 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     ggml_backend_webgpu_context * backend_ctx = (ggml_backend_webgpu_context *) backend->context;
     webgpu_context                ctx         = backend_ctx->webgpu_ctx;
 
+    // a paged graph keeps its slot assignments until its last dispatch is submitted; later queue writes run after it
+    std::unique_lock<std::mutex> paged_lock(g_paged_mutex, std::defer_lock);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID && ggml_webgpu_paged(cgraph->nodes[i]->src[0]) != nullptr) {
+            paged_lock.lock();
+            break;
+        }
+    }
+
     WEBGPU_CPU_PROFILE_TOTAL_START(graph_compute);
 
     std::vector<webgpu_encoded_op> commands;
@@ -4047,6 +4099,11 @@ static void ggml_backend_webgpu_set_tensor_async(ggml_backend_t backend,
                                                  size_t         offset,
                                                  size_t         size) {
     GGML_UNUSED(backend);
+    if (ggml_webgpu_buffer_is_paged(tensor->buffer)) {
+        // no GPU storage of its own: the bytes go to the page source (or host copy)
+        tensor->buffer->iface.set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
     auto * buf_ctx      = (ggml_backend_webgpu_buffer_context *) tensor->buffer->context;
     size_t total_offset = ggml_webgpu_tensor_offset(tensor) + offset;
 
@@ -4756,8 +4813,16 @@ static enum ggml_status ggml_backend_webgpu_paged_buffer_init_tensor(ggml_backen
     pg->expert_of = std::vector<uint32_t>(pg->n_slots, WEBGPU_PAGED_ABSENT);
     pg->last_use  = std::vector<uint64_t>(pg->n_slots, 0);
 
+    const uint64_t pool_bytes = ROUNDUP_POW2((uint64_t) pg->n_slots * pg->slab, WEBGPU_STORAGE_BUF_BINDING_MULT);
+    const auto &   limits     = ctx->global_ctx->capabilities.limits;
+    if (pool_bytes > limits.maxBufferSize || pool_bytes > limits.maxStorageBufferBindingSize) {
+        GGML_LOG_ERROR("ggml_webgpu: paged pool of %s is %llu bytes (%u slots), over the device limit; use fewer slots\n",
+                       tensor->name, (unsigned long long) pool_bytes, pg->n_slots);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+
     wgpu::Device & device = ctx->global_ctx->device;
-    ggml_webgpu_create_buffer(device, pg->pool, ROUNDUP_POW2(pg->n_slots * pg->slab, WEBGPU_STORAGE_BUF_BINDING_MULT),
+    ggml_webgpu_create_buffer(device, pg->pool, (size_t) pool_bytes,
                               wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
                               (std::string("paged_pool_") + tensor->name).c_str());
     ggml_webgpu_create_buffer(device, pg->slot_map, pg->n_expert * sizeof(uint32_t),
@@ -4775,9 +4840,11 @@ static void ggml_backend_webgpu_paged_buffer_set_tensor(ggml_backend_buffer_t bu
                                                         const void *          data,
                                                         size_t                offset,
                                                         size_t                size) {
-    GGML_UNUSED(buffer);
     webgpu_paged_tensor * pg = ggml_webgpu_paged(tensor);
     GGML_ASSERT(pg != nullptr && tensor->view_src == nullptr);
+    std::lock_guard<std::mutex> lock(g_paged_mutex);
+    ggml_webgpu_paged_invalidate(static_cast<ggml_backend_webgpu_buffer_context *>(buffer->context)->global_ctx, *pg,
+                                 offset, size);
     if (pg->buft->has_source) {
         const ggml_webgpu_page_source & src = pg->buft->source;
         if (src.has == nullptr || !src.has(src.user_data, pg->name.c_str(), ggml_nbytes(tensor))) {
@@ -4812,18 +4879,23 @@ static void ggml_backend_webgpu_paged_buffer_memset_tensor(ggml_backend_buffer_t
                                                            uint8_t               value,
                                                            size_t                offset,
                                                            size_t                size) {
-    GGML_UNUSED(buffer);
     webgpu_paged_tensor * pg = ggml_webgpu_paged(tensor);
-    GGML_ASSERT(pg != nullptr && !pg->buft->has_source);
-    if (pg->ram.size() < ggml_nbytes(tensor)) {
-        pg->ram.resize(ggml_nbytes(tensor));
-    }
-    memset(pg->ram.data() + offset, value, size);
+    GGML_ASSERT(pg != nullptr && tensor->view_src == nullptr);
+    std::lock_guard<std::mutex> lock(g_paged_mutex);
+    ggml_webgpu_paged_invalidate(static_cast<ggml_backend_webgpu_buffer_context *>(buffer->context)->global_ctx, *pg,
+                                 offset, size);
+    ggml_webgpu_paged_write_value(*pg, value, offset, size);
 }
 
 static void ggml_backend_webgpu_paged_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    GGML_UNUSED(buffer);
-    GGML_UNUSED(value);  // weights are written by set_tensor; nothing on the GPU to clear
+    auto *                      ctx = static_cast<ggml_backend_webgpu_buffer_context *>(buffer->context);
+    std::lock_guard<std::mutex> lock(g_paged_mutex);
+    for (auto & it : ctx->pages) {
+        webgpu_paged_tensor & pg     = *it.second;
+        const size_t          nbytes = (size_t) pg.n_expert * pg.slab;
+        ggml_webgpu_paged_invalidate(ctx->global_ctx, pg, 0, nbytes);
+        ggml_webgpu_paged_write_value(pg, value, 0, nbytes);
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_webgpu_paged_buffer_interface = {
@@ -4873,6 +4945,18 @@ ggml_backend_buffer_type_t ggml_backend_webgpu_paged_buffer_type(ggml_backend_de
     static std::vector<std::unique_ptr<ggml_webgpu_paged_buft_context>> contexts;
     static std::vector<std::unique_ptr<ggml_backend_buffer_type>>       bufts;
     std::lock_guard<std::mutex>                                      lock(mutex);
+
+    // the same configuration gets the same buffer type, so repeated model loads do not grow these lists
+    for (size_t i = 0; i < contexts.size(); i++) {
+        const ggml_webgpu_paged_buft_context & c = *contexts[i];
+        if (bufts[i]->device == dev && c.n_slots == n_slots && c.has_source == (source != nullptr) &&
+            (source == nullptr ||
+             (c.source.user_data == source->user_data && c.source.has == source->has && c.source.write == source->write &&
+              c.source.read == source->read && c.source.read_batch == source->read_batch &&
+              c.source.upload_batch == source->upload_batch))) {
+            return bufts[i].get();
+        }
+    }
 
     auto ctx        = std::make_unique<ggml_webgpu_paged_buft_context>();
     ctx->n_slots    = n_slots;
@@ -5004,6 +5088,16 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
     }
 }
 
+// Bytes an op binds for a tensor: a paged tensor binds only its pool of experts.
+static uint64_t ggml_webgpu_bound_nbytes(const ggml_tensor * t) {
+    if (ggml_webgpu_buffer_is_paged(t->buffer) && t->ne[2] > 0) {
+        const auto *   buft    = static_cast<const ggml_webgpu_paged_buft_context *>(t->buffer->buft->context);
+        const uint64_t n_slots = std::min<uint64_t>(buft->n_slots, (uint64_t) t->ne[2]);
+        return ROUNDUP_POW2(n_slots * t->nb[2], WEBGPU_STORAGE_BUF_BINDING_MULT);
+    }
+    return ggml_nbytes(t);
+}
+
 static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_webgpu_device_context * ctx = static_cast<ggml_backend_webgpu_device_context *>(dev->context);
 
@@ -5022,15 +5116,11 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
     if (ggml_webgpu_buffer_is_paged(op->buffer) && op->op != GGML_OP_NONE) {
         return false;  // a paged buffer holds weights (graph leaves), never op results
     }
-    const bool src0_paged = src0 != nullptr && ggml_webgpu_buffer_is_paged(src0->buffer);
-
     // on smaller devices (or CI), tensors may be larger than the max storage buffer size
-    // (a paged src0 binds only its pool)
-    if (ggml_nbytes(op) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize ||
-        (src0 != nullptr && !src0_paged &&
-         ggml_nbytes(src0) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize) ||
-        (src1 != nullptr &&
-         ggml_nbytes(src1) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize)) {
+    const uint64_t max_binding = ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize;
+    if (ggml_webgpu_bound_nbytes(op) > max_binding ||
+        (src0 != nullptr && ggml_webgpu_bound_nbytes(src0) > max_binding) ||
+        (src1 != nullptr && ggml_webgpu_bound_nbytes(src1) > max_binding)) {
         return false;
     }
 
@@ -5386,13 +5476,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
         default:
             break;
     }
-    if (ggml_nbytes(op) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize ||
-        (src0 != nullptr &&
-         ggml_nbytes(src0) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize) ||
-        (src1 != nullptr &&
-         ggml_nbytes(src1) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize) ||
-        (src2 != nullptr &&
-         ggml_nbytes(src2) > ctx->webgpu_global_ctx->capabilities.limits.maxStorageBufferBindingSize)) {
+    if (ggml_webgpu_bound_nbytes(op) > max_binding || (src0 != nullptr && ggml_webgpu_bound_nbytes(src0) > max_binding) ||
+        (src1 != nullptr && ggml_webgpu_bound_nbytes(src1) > max_binding) ||
+        (src2 != nullptr && ggml_webgpu_bound_nbytes(src2) > max_binding)) {
         supports_op = false;
         WEBGPU_LOG_DEBUG("ggml_webgpu op not supported due to size: ");
     }
