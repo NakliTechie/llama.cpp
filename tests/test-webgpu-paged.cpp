@@ -295,12 +295,8 @@ int main() {
     }
     size_t n_checks = configs.size();
 
-    // repeated ids within a token, with passes (3 slots) and without. Needs the duplicate-id MUL_MAT_ID shaders of
-    // upstream #30451, which this branch predates (the plain path differs too), so it runs only when asked.
+    // repeated ids within a token, with passes (3 slots) and without
     for (int n_tokens : { 1, 5 }) {
-        if (getenv("TEST_REPEATED_IDS") == nullptr) {
-            break;
-        }
         for (int n_slots : { 3, 16 }) {
             config c = { GGML_TYPE_Q4_0, 16, 4, n_tokens, 256, 64, n_slots, false };
             auto   as_data = make_weights(c, rng);
