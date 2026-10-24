@@ -79,7 +79,11 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     }
 
     if (ista) {
-        ml.get_key(pre + "attention.candidate_source_layer_id", hparams.dsv41_cand_src, false);
+        // ISTA stores the layer id as u32 (no "none" value: the key is absent instead)
+        uint32_t cand_src = 0;
+        if (ml.get_key(pre + "attention.candidate_source_layer_id", cand_src, false)) {
+            hparams.dsv41_cand_src = (int32_t) cand_src;
+        }
     } else {
         ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, hparams.dsv41_cand_src, false);
     }
