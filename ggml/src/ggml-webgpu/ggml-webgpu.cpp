@@ -5585,24 +5585,26 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                 const bool tile_can_dispatch_all_q_rows =
                     capabilities.limits.maxComputeInvocationsPerWorkgroup >=
                     GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE * capabilities.max_subgroup_size;
-                const bool use_tile = !use_subgroup_matrix && capabilities.supports_subgroups && float_vec4_aligned &&
-                                      tile_kv_head_dims_aligned && tile_can_dispatch_all_q_rows;
+                const bool can_use_tile = capabilities.supports_subgroups && float_vec4_aligned &&
+                                          tile_kv_head_dims_aligned && tile_can_dispatch_all_q_rows;
 
-                if (!use_subgroup_matrix && !use_tile) {
-                    supports_op = false;
-                    break;
+                if (use_subgroup_matrix) {
+                    const bool kv_direct = ggml_webgpu_flash_attn_k_direct(src0, src1, capabilities.sg_mat_k) ||
+                                           ggml_webgpu_flash_attn_v_direct(src0, src2, capabilities.sg_mat_k);
+                    if (ggml_webgpu_flash_attn_max_kv_tile(capabilities.limits.maxComputeWorkgroupStorageSize,
+                                                           capabilities.sg_mat_m, capabilities.sg_mat_n,
+                                                           (uint32_t) src0->ne[0], (uint32_t) src2->ne[0],
+                                                           op->src[3] != nullptr, kv_direct) > 0) {
+                        supports_op = true;
+                        break;
+                    }
+                    // too big for workgroup memory on the subgroup matrix path (e.g. head size 512): the pipeline
+                    // falls back to the tile path, so support the op when the tile path can take it
                 }
-                const uint32_t q_tile =
-                    use_subgroup_matrix ? capabilities.sg_mat_m : GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE;
-                const uint32_t kv_granularity = use_subgroup_matrix ? capabilities.sg_mat_n : 1u;
-                const bool     kv_direct = use_subgroup_matrix ?
-                                               ggml_webgpu_flash_attn_k_direct(src0, src1, capabilities.sg_mat_k) ||
-                                                   ggml_webgpu_flash_attn_v_direct(src0, src2, capabilities.sg_mat_k) :
-                                               false;
-                const uint32_t max_kv_tile = ggml_webgpu_flash_attn_max_kv_tile(
-                    capabilities.limits.maxComputeWorkgroupStorageSize, q_tile, kv_granularity, (uint32_t) src0->ne[0],
-                    (uint32_t) src2->ne[0], op->src[3] != nullptr, kv_direct);
-                supports_op = max_kv_tile > 0;
+                supports_op = can_use_tile && ggml_webgpu_flash_attn_max_kv_tile(
+                                                  capabilities.limits.maxComputeWorkgroupStorageSize,
+                                                  GGML_WEBGPU_FLASH_ATTN_TILE_Q_TILE, 1u, (uint32_t) src0->ne[0],
+                                                  (uint32_t) src2->ne[0], op->src[3] != nullptr, false) > 0;
                 break;
             }
         case GGML_OP_RMS_NORM:
