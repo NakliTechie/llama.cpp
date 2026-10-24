@@ -158,6 +158,13 @@ struct common_log_entry {
     }
 };
 
+// wasm built without pthreads cannot start the worker thread (std::thread throws): print synchronously instead
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#define COMMON_LOG_NO_THREAD 1
+#else
+#define COMMON_LOG_NO_THREAD 0
+#endif
+
 struct common_log {
     // default capacity
     common_log(size_t capacity = 512) {
@@ -292,6 +299,10 @@ public:
             entry.timestamp = t_us() - t_start;
         }
 
+#if COMMON_LOG_NO_THREAD
+        print_entry(entry);
+        return;
+#endif
         tail = (tail + 1) % queue.size();
         cv_new.notify_one();
     }
@@ -341,6 +352,9 @@ public:
 
         running = true;
 
+#if COMMON_LOG_NO_THREAD
+        return;  // no threads: add() prints each entry itself
+#endif
         thrd = std::thread([this]() {
             while (true) {
                 std::unique_lock<std::mutex> lock(mtx);
@@ -374,6 +388,9 @@ public:
             }
 
             running = false;
+#if COMMON_LOG_NO_THREAD
+            return;
+#endif
 
             // push an entry to signal the worker thread to stop
             auto & entry = queue[tail];
