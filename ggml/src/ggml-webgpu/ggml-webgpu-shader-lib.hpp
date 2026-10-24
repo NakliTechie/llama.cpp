@@ -3196,6 +3196,10 @@ class ggml_webgpu_shader_lib {
                 defines.push_back("SRC_I32");
                 variant += "_i32";
                 break;
+            case GGML_TYPE_BF16:
+                defines.push_back("SRC_BF16");
+                variant += "_bf16";
+                break;
             default:
                 GGML_ABORT("Unsupported src type for cpy shader");
         }

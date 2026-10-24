@@ -6,6 +6,9 @@ enable f16;
 #define SRC_TYPE f16
 #elif defined(SRC_I32)
 #define SRC_TYPE i32
+#elif defined(SRC_BF16)
+// WGSL has no bf16: two values per u32, the upper 16 bits of an f32
+#define SRC_TYPE u32
 #endif
 
 #ifdef DST_F32
@@ -80,5 +83,11 @@ fn main(
     let dst_idx = j0 * params.stride_dst0 + j1 * params.stride_dst1 +
                   j2 * params.stride_dst2 + j3 * params.stride_dst3;
 
+#ifdef SRC_BF16
+    let e = params.offset_src + src_idx;
+    let bits = (src[e / 2u] >> ((e % 2u) * 16u)) & 0xffffu;
+    dst[params.offset_dst + dst_idx] = DST_TYPE(bitcast<f32>(bits << 16u));
+#else
     dst[params.offset_dst + dst_idx] = DST_TYPE((src[params.offset_src + src_idx]));
+#endif
 }
