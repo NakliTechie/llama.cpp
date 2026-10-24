@@ -1509,6 +1509,19 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     std::vector<uint64_t> engram_primes;
     std::vector<uint64_t> engram_offsets; // first row of each (layer, order, head) in per_layer_token_embd
 
+    // Engram tables in a separate GGUF (ISTA-DASLab layout: `deepseek41.engram.file`, one table per Engram layer,
+    // q and k gate halves unfused). Rows are read from that file on the host, a few per token, so the ~110 GB of
+    // tables are never mapped or loaded. engram_offsets are then global row ids over the tables in layer order.
+    std::string           engram_file;       // path; empty: the tables are per_layer_token_embd in the model GGUF
+    ggml_type             engram_file_type = GGML_TYPE_COUNT;
+    size_t                engram_row_bytes = 0;
+    std::vector<int64_t>  engram_file_rows;  // rows of each table, in layer order
+    std::vector<size_t>   engram_file_offs;  // file offset of each table's data
+    mutable std::unique_ptr<llama_file> engram_fp;
+    mutable std::vector<uint8_t> engram_buf;
+
+    void engram_read_rows(const int32_t * ids, int64_t n_ids, float * dst) const;
+
     int engram_index(int il) const;
     uint32_t engram_n_cols() const { return (engram_max_ngram - 1)*engram_n_head; }
 

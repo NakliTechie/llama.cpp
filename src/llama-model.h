@@ -608,6 +608,7 @@ struct llama_layer {
     // deepseek41
     struct ggml_tensor * engram_kv   = nullptr;
     struct ggml_tensor * engram_gate = nullptr; // q_weight*k_weight folded
+    struct ggml_tensor * engram_gate_k = nullptr; // ISTA-DASLab layout: k_weight; engram_gate then holds q_weight
 
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;

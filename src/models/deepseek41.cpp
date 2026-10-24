@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -31,10 +32,20 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     }
 
     // each compressed layer reads the KV / top-k of the latest source layer at or before it
+    // ISTA-DASLab's GGUFs (DeepSeek-V4.1-Flash-1017-GSQ-RCO) name some keys differently and keep the Engram
+    // tables in a separate GGUF named by `<arch>.engram.file`
+    const std::string pre  = ml.get_arch_name() + ".";
+    const bool        ista = gguf_find_key(ml.metadata, (pre + "engram.file").c_str()) >= 0;
+
     std::vector<uint32_t> kv_src;
     std::vector<uint32_t> idx_src;
-    ml.get_arr(LLM_KV_ATTENTION_KV_SOURCE_LAYERS,      kv_src);
-    ml.get_arr(LLM_KV_ATTENTION_INDEXER_SOURCE_LAYERS, idx_src);
+    if (ista) {
+        ml.get_arr(pre + "kv_source_layer_ids",    kv_src);
+        ml.get_arr(pre + "index_source_layer_ids", idx_src);
+    } else {
+        ml.get_arr(LLM_KV_ATTENTION_KV_SOURCE_LAYERS,      kv_src);
+        ml.get_arr(LLM_KV_ATTENTION_INDEXER_SOURCE_LAYERS, idx_src);
+    }
 
     const uint32_t n_layer = hparams.n_layer();
     const auto out_of_range = [&](const std::vector<uint32_t> & v) {
@@ -67,10 +78,19 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         hparams.dsv41_topk_src[il] = last_idx;
     }
 
-    ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, hparams.dsv41_cand_src, false);
+    if (ista) {
+        ml.get_key(pre + "attention.candidate_source_layer_id", hparams.dsv41_cand_src, false);
+    } else {
+        ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, hparams.dsv41_cand_src, false);
+    }
     if (hparams.dsv41_cand_src >= 0) {
-        ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.dsv41_cand_topk_blocks);
-        ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.dsv41_cand_block_size);
+        if (ista) {
+            ml.get_key(pre + "attention.candidate_topk_blocks", hparams.dsv41_cand_topk_blocks);
+            ml.get_key(pre + "attention.candidate_block_size",  hparams.dsv41_cand_block_size);
+        } else {
+            ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.dsv41_cand_topk_blocks);
+            ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.dsv41_cand_block_size);
+        }
         const int32_t cs = hparams.dsv41_cand_src;
         if ((uint32_t) cs >= n_layer || hparams.dsv41_topk_src[cs] != cs || hparams.dsv41_cand_block_size == 0 ||
                 hparams.dsv41_cand_topk_blocks == 0) {
@@ -84,8 +104,57 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     }
 
     std::vector<uint32_t> e_layers;
-    ml.get_arr(LLM_KV_PLE_LAYERS, e_layers, false);
-    if (!e_layers.empty()) {
+    if (ista) {
+        ml.get_arr(pre + "engram.layer_ids", e_layers, false);
+    } else {
+        ml.get_arr(LLM_KV_PLE_LAYERS, e_layers, false);
+    }
+    if (!e_layers.empty() && ista) {
+        ml.get_key(pre + "engram_max_ngram_size", engram_max_ngram);
+        ml.get_key(pre + "engram_n_heads",        engram_n_head);
+        ml.get_key(pre + "engram_head_dim",       engram_head_dim);
+        ml.get_key(pre + "engram_pad_token_id",   engram_pad_id);
+        std::vector<uint32_t> rows;
+        ml.get_arr(pre + "engram.num_embeddings", rows);
+        engram_file_rows.assign(rows.begin(), rows.end());
+
+        // the hash constants are small tensors in the backbone, read here
+        const auto read = [&](const char * name, ggml_type type, auto & out) {
+            const auto * w = ml.get_weight(name);
+            if (!w || w->tensor->type != type) {
+                throw std::runtime_error(format("DeepSeek-V4.1 (ISTA layout): %s is missing or not %s", name, ggml_type_name(type)));
+            }
+            out.resize(ggml_nelements(w->tensor));
+            ml.files.at(w->idx)->seek(w->offs, SEEK_SET);
+            ml.files.at(w->idx)->read_raw(out.data(), ggml_nbytes(w->tensor));
+        };
+        read("engram_multipliers.weight", GGML_TYPE_I64, engram_mult);
+        read("engram_primes.weight",      GGML_TYPE_I64, engram_primes);
+        read("engram_offsets.weight",     GGML_TYPE_I64, engram_offsets);
+        read("engram_token_map.weight",   GGML_TYPE_I32, engram_token_map);
+
+        // per-table row ids become global ids over the tables in layer order, the PR's single-table layout
+        const size_t n_cols = engram_n_cols();
+        if (engram_file_rows.size() != e_layers.size() || engram_offsets.size() != e_layers.size()*n_cols) {
+            throw std::runtime_error("DeepSeek-V4.1 (ISTA layout): engram tables do not match the engram layers");
+        }
+        uint64_t base = 0;
+        for (size_t e = 0; e < e_layers.size(); ++e) {
+            for (size_t c = 0; c < n_cols; ++c) {
+                if (engram_offsets[e*n_cols + c] + engram_primes[e*n_cols + c] > (uint64_t) engram_file_rows[e]) {
+                    throw std::runtime_error(format("DeepSeek-V4.1 (ISTA layout): engram layer %zu head %zu is outside its table", e, c));
+                }
+                engram_offsets[e*n_cols + c] += base;
+            }
+            base += engram_file_rows[e];
+        }
+
+        std::string file;
+        ml.get_key(pre + "engram.file", file);
+        const char * env = getenv("LLAMA_DSV41_ENGRAM_FILE");
+        const size_t slash = ml.fname.find_last_of("/\\");
+        engram_file = env ? std::string(env) : (slash == std::string::npos ? file : ml.fname.substr(0, slash + 1) + file);
+    } else if (!e_layers.empty()) {
         ml.get_key(LLM_KV_PLE_NGRAM_SIZE,             engram_max_ngram);
         ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM,        engram_n_head);
         ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, engram_head_dim);
@@ -94,7 +163,8 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,       engram_primes);
         ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN_ID,        engram_pad_id);
         ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP,           engram_token_map);
-
+    }
+    if (!e_layers.empty()) {
         const size_t n_e    = e_layers.size();
         const size_t n_cols = engram_n_cols();
         if (engram_max_ngram < 2 || engram_n_head == 0 || engram_head_dim == 0 ||
@@ -138,8 +208,32 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    // all Engram tables in one lazily read tensor, like the qwen4exp n-gram table
-    if (!engram_layers.empty()) {
+    if (!engram_file.empty()) {
+        // ISTA layout: find each table in the Engram GGUF; rows are read in engram_read_rows
+        struct ggml_context * ectx = nullptr;
+        gguf_context_ptr meta(gguf_init_from_file(engram_file.c_str(), { /*.no_alloc =*/ true, /*.ctx =*/ &ectx }));
+        ggml_context_ptr ectx_ptr(ectx);
+        if (!meta) {
+            throw std::runtime_error(format("DeepSeek-V4.1: cannot read the Engram file %s (keep it beside the model, or set LLAMA_DSV41_ENGRAM_FILE)", engram_file.c_str()));
+        }
+        for (size_t e = 0; e < engram_layers.size(); ++e) {
+            const std::string name = format("blk.%d.engram_embd.weight", engram_layers[e]);
+            const int64_t     id   = gguf_find_tensor(meta.get(), name.c_str());
+            const ggml_tensor * t  = id < 0 ? nullptr : ggml_get_tensor(ectx, name.c_str());
+            if (!t || t->ne[0] != (int64_t) engram_head_dim || t->ne[1] != engram_file_rows[e] ||
+                    (engram_file_type != GGML_TYPE_COUNT && t->type != engram_file_type) ||
+                    (t->type != GGML_TYPE_F32 && !ggml_get_type_traits(t->type)->to_float)) {
+                throw std::runtime_error(format("DeepSeek-V4.1: %s in %s is missing or has the wrong shape or type", name.c_str(), engram_file.c_str()));
+            }
+            engram_file_type = t->type;
+            engram_file_offs.push_back(gguf_get_data_offset(meta.get()) + gguf_get_tensor_offset(meta.get(), id));
+        }
+        engram_row_bytes = ggml_row_size(engram_file_type, engram_head_dim);
+        engram_fp = std::make_unique<llama_file>(engram_file.c_str(), "rb");
+        LLAMA_LOG_INFO("%s: Engram tables: %zu in %s (%s), read on the host\n", __func__, engram_layers.size(),
+                engram_file.c_str(), ggml_type_name(engram_file_type));
+    } else if (!engram_layers.empty()) {
+        // all Engram tables in one lazily read tensor, like the qwen4exp n-gram table
         int64_t n_rows = 0;
         for (size_t c = 0; c < engram_offsets.size(); ++c) {
             n_rows = std::max(n_rows, (int64_t) (engram_offsets[c] + engram_primes[c]));
@@ -190,8 +284,14 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         }
 
         if (engram_index(i) >= 0) {
-            layer.engram_kv   = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {(int64_t) engram_n_cols() * engram_head_dim, n_embd * (hc_mult + 1)}, 0);
-            layer.engram_gate = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
+            if (!engram_file.empty()) {
+                layer.engram_kv     = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV, "weight", i), {(int64_t) engram_n_cols() * engram_head_dim, n_embd * (hc_mult + 1)}, 0);
+                layer.engram_gate   = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,   "weight", i), {n_embd, hc_mult}, 0);
+                layer.engram_gate_k = create_tensor(tn(LLM_TENSOR_ENGRAM_K,   "weight", i), {n_embd, hc_mult}, 0);
+            } else {
+                layer.engram_kv   = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {(int64_t) engram_n_cols() * engram_head_dim, n_embd * (hc_mult + 1)}, 0);
+                layer.engram_gate = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
+            }
         }
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
@@ -215,6 +315,28 @@ std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(cons
                 "(convert_hf_to_gguf.py --dspark), used with --spec-type draft-dspark");
     }
     return std::make_unique<graph>(*this, params);
+}
+
+// ISTA layout: global row ids -> (table, row) -> one read each from the Engram file, converted to F32 like GET_ROWS
+void llama_model_deepseek41::engram_read_rows(const int32_t * ids, int64_t n_ids, float * dst) const {
+    const ggml_to_float_t to_float = engram_file_type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(engram_file_type)->to_float;
+    engram_buf.resize(engram_row_bytes);
+    for (int64_t i = 0; i < n_ids; ++i) {
+        int64_t r = ids[i];
+        size_t  e = 0;
+        while (e < engram_file_rows.size() && r >= engram_file_rows[e]) {
+            r -= engram_file_rows[e++];
+        }
+        GGML_ASSERT(r >= 0 && e < engram_file_rows.size());
+        engram_fp->seek(engram_file_offs[e] + (size_t) r*engram_row_bytes, SEEK_SET);
+        engram_fp->read_raw(engram_buf.data(), engram_row_bytes);
+        float * out = dst + i*engram_head_dim;
+        if (to_float) {
+            to_float(engram_buf.data(), out, engram_head_dim);
+        } else {
+            memcpy(out, engram_buf.data(), engram_head_dim*sizeof(float));
+        }
+    }
 }
 
 // Engram n-gram hash (engram.py NgramHashState.forward)
@@ -300,13 +422,17 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             model.engram_hash((int) e, *ubatch, prev, ids[e]);
             all.insert(all.end(), ids[e].begin(), ids[e].end());
         }
-        if (model.can_prefetch.count(model.per_layer_tok_embd)) {
+        if (model.per_layer_tok_embd && model.can_prefetch.count(model.per_layer_tok_embd)) {
             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
         }
         std::vector<float> rows;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             if (engram_ids[e]->buffer) {
-                if (engram_tab[e]) {
+                if (!model.engram_file.empty()) {
+                    rows.resize(ids[e].size()*model.engram_head_dim);
+                    model.engram_read_rows(ids[e].data(), (int64_t) ids[e].size(), rows.data());
+                    ggml_backend_tensor_set(engram_ids[e], rows.data(), 0, rows.size()*sizeof(float));
+                } else if (engram_tab[e]) {
                     // host gather: same rows and conversion as the CPU GET_ROWS
                     rows.resize(ids[e].size()*engram_tab[e]->ne[0]);
                     llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
@@ -393,6 +519,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
 
     // quantized copy has no binary-op kernel
     ggml_tensor * egate = ggml_is_quantized(layer.engram_gate->type) ? ggml_cast(ctx0, layer.engram_gate, GGML_TYPE_F32) : layer.engram_gate;
+    if (layer.engram_gate_k) {
+        // ISTA layout: gate = q * k, in F32 (exact for BF16 halves, as the PR's converter folds it)
+        egate = ggml_mul(ctx0, ggml_cast(ctx0, layer.engram_gate, GGML_TYPE_F32), ggml_cast(ctx0, layer.engram_gate_k, GGML_TYPE_F32));
+    }
     ggml_tensor * dot = ggml_mul(ctx0, ggml_mul(ctx0, ggml_rms_norm(ctx0, x, norm_rms_eps), ggml_rms_norm(ctx0, key, norm_rms_eps)), egate);
     dot = ggml_scale(ctx0, ggml_sum_rows(ctx0, dot), 1.0f/sqrtf((float) n_embd));
     cb(dot, "engram_dot", il);
@@ -795,7 +925,12 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         const int32_t il = model.engram_layers[e];
         const ggml_tensor * tab = model.per_layer_tok_embd;
         ggml_tensor * ids = nullptr;
-        if (host_gather && llm_graph_host_rows_supported(tab) && tab->ne[0] == (int64_t) model.engram_head_dim) {
+        if (!model.engram_file.empty()) {
+            // Engram file: rows are read in set_input
+            tab = nullptr;
+            ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) model.engram_n_cols()*model.engram_head_dim, n_tokens);
+            ggml_set_name(ids, ("engram_rows_in-" + std::to_string(il)).c_str());
+        } else if (host_gather && llm_graph_host_rows_supported(tab) && tab->ne[0] == (int64_t) model.engram_head_dim) {
             // host-resident table: rows are gathered in set_input
             ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) model.engram_n_cols()*tab->ne[0], n_tokens);
             ggml_set_name(ids, ("engram_rows_in-" + std::to_string(il)).c_str());

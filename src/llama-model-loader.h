@@ -131,6 +131,7 @@ struct llama_model_loader {
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
 
+    std::string fname;      // the main GGUF's path (empty when loaded from a gguf_context)
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
