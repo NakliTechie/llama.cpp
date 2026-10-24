@@ -1532,6 +1532,96 @@ static webgpu_encoded_op ggml_webgpu_lightning_indexer(webgpu_context & ctx, ggm
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
+static webgpu_encoded_op ggml_webgpu_top_k_mask(webgpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * mask   = dst->src[0];
+    const ggml_tensor * top_k  = dst->src[1];
+    const ggml_tensor * score  = dst->src[2];
+    const ggml_tensor * blocks = dst->src[3];
+    const ggml_tensor * extra  = dst->src[4];
+
+    // only the optional inputs present are bound, after mask, top_k and dst; the uniform follows them
+    std::vector<std::string> defines;
+    std::string              variant = "top_k_mask";
+    uint32_t                 binding = 3;
+    if (dst->type == GGML_TYPE_F16) {
+        defines.push_back("MASK_F16");
+        variant += "_f16";
+    }
+    if (score) {
+        defines.push_back("HAS_SCORE");
+        defines.push_back("BIND_SCORE=" + std::to_string(binding++));
+        variant += "_score";
+    }
+    if (blocks) {
+        defines.push_back("HAS_BLOCKS");
+        defines.push_back("BIND_BLOCKS=" + std::to_string(binding++));
+        variant += "_blocks";
+    }
+    if (extra) {
+        defines.push_back("HAS_EXTRA");
+        defines.push_back("BIND_EXTRA=" + std::to_string(binding++));
+        variant += "_extra";
+    }
+    defines.push_back("BIND_PARAMS=" + std::to_string(binding));
+    webgpu_pipeline pipeline =
+        ctx->shader_lib->get_named_pipeline(variant, wgsl_top_k_mask, defines, ggml_webgpu_items_wg_size(ctx));
+
+    const uint32_t        n_rows = (uint32_t) ggml_nrows(dst);
+    std::vector<uint32_t> params = {
+        ggml_webgpu_elem_offset(ctx, mask),
+        ggml_webgpu_elem_offset(ctx, top_k),
+        score ? ggml_webgpu_elem_offset(ctx, score) : 0u,
+        blocks ? ggml_webgpu_elem_offset(ctx, blocks) : 0u,
+        extra ? ggml_webgpu_elem_offset(ctx, extra) : 0u,
+        ggml_webgpu_elem_offset(ctx, dst),
+        ggml_webgpu_elem_stride(mask, 1),
+        ggml_webgpu_elem_stride(mask, 2),
+        ggml_webgpu_elem_stride(mask, 3),
+        (uint32_t) mask->ne[1],
+        (uint32_t) mask->ne[2],
+        (uint32_t) mask->ne[3],
+        ggml_webgpu_elem_stride(dst, 1),
+        ggml_webgpu_elem_stride(dst, 2),
+        ggml_webgpu_elem_stride(dst, 3),
+        ggml_webgpu_elem_stride(top_k, 0),
+        ggml_webgpu_elem_stride(top_k, 1),
+        ggml_webgpu_elem_stride(top_k, 2),
+        ggml_webgpu_elem_stride(top_k, 3),
+        score ? ggml_webgpu_elem_stride(score, 0) : 0u,
+        score ? ggml_webgpu_elem_stride(score, 1) : 0u,
+        score ? ggml_webgpu_elem_stride(score, 2) : 0u,
+        score ? ggml_webgpu_elem_stride(score, 3) : 0u,
+        blocks ? ggml_webgpu_elem_stride(blocks, 0) : 0u,
+        blocks ? ggml_webgpu_elem_stride(blocks, 1) : 0u,
+        extra ? ggml_webgpu_elem_stride(extra, 0) : 0u,
+        extra ? ggml_webgpu_elem_stride(extra, 1) : 0u,
+        extra ? ggml_webgpu_elem_stride(extra, 2) : 0u,
+        extra ? ggml_webgpu_elem_stride(extra, 3) : 0u,
+        (uint32_t) mask->ne[0],
+        (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2],
+        n_rows,
+        (uint32_t) top_k->ne[0],
+        blocks ? (uint32_t) blocks->ne[0] : 1u,
+        (uint32_t) (blocks ? blocks->ne[1] : score ? score->ne[0] : mask->ne[0]),
+        extra ? (uint32_t) extra->ne[0] : 0u,
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, (ggml_tensor *) mask),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, (ggml_tensor *) top_k),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst),
+    };
+    for (const ggml_tensor * t : { score, blocks, extra }) {
+        if (t) {
+            entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, (uint32_t) entries.size(), (ggml_tensor *) t));
+        }
+    }
+    // one workgroup per row
+    uint32_t wg_x, wg_y;
+    compute_2d_workgroups(n_rows, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+}
+
 static webgpu_encoded_op ggml_webgpu_pool_1d(webgpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src  = dst->src[0];
     const int32_t *     opts = (const int32_t *) dst->op_params;
@@ -3827,6 +3917,8 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_dsv4_hc_comb(ctx, node);
         case GGML_OP_POOL_1D:
             return ggml_webgpu_pool_1d(ctx, node);
+        case GGML_OP_TOP_K_MASK:
+            return ggml_webgpu_top_k_mask(ctx, node);
         case GGML_OP_SSM_SCAN:
             return ggml_webgpu_ssm_scan(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node->src[6],
                                         node);
@@ -5425,7 +5517,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             supports_op = src0->type == GGML_TYPE_F32;
             break;
         case GGML_OP_CONCAT:
-            supports_op = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_I32);
+            supports_op = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_I32) &&
+                          src1->type == src0->type && op->type == src0->type;
             break;
         case GGML_OP_REPEAT:
             supports_op = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_I32 ||
@@ -5715,6 +5808,9 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_DSV4_HC_COMB:
             supports_op = op->type == GGML_TYPE_F32;
+            break;
+        case GGML_OP_TOP_K_MASK:
+            supports_op = op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
             break;
         case GGML_OP_POOL_1D:
             {

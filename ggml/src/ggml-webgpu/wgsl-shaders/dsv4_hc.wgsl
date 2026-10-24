@@ -3,8 +3,8 @@
 // for it is passed.
 
 #ifdef HC_PRE
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 
 struct Params {
@@ -49,11 +49,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 #endif
 
 #ifdef HC_POST
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> residual: array<f32>;
-@group(0) @binding(2) var<storage, read> post: array<f32>;
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> residual: array<f32>;
+@group(0) @binding(2) var<storage, read_write> post: array<f32>;
 #ifdef HAS_COMB
-@group(0) @binding(3) var<storage, read> comb: array<f32>;
+@group(0) @binding(3) var<storage, read_write> comb: array<f32>;
 @group(0) @binding(4) var<storage, read_write> dst: array<f32>;
 #else
 @group(0) @binding(3) var<storage, read_write> dst: array<f32>;
@@ -110,9 +110,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 #endif
 
 #ifdef HC_COMB
-@group(0) @binding(0) var<storage, read> mixes: array<f32>;
-@group(0) @binding(1) var<storage, read> scale: array<f32>;
-@group(0) @binding(2) var<storage, read> base: array<f32>;
+@group(0) @binding(0) var<storage, read_write> mixes: array<f32>;
+@group(0) @binding(1) var<storage, read_write> scale: array<f32>;
+@group(0) @binding(2) var<storage, read_write> base: array<f32>;
 @group(0) @binding(3) var<storage, read_write> dst: array<f32>;
 
 struct Params {

@@ -9,7 +9,7 @@ enable f16;
 #define SrcType f32
 #endif
 
-@group(0) @binding(0) var<storage, read> src: array<SrcType>;
+@group(0) @binding(0) var<storage, read_write> src: array<SrcType>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 
 struct Params {
