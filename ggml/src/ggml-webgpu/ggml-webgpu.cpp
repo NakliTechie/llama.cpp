@@ -1345,6 +1345,231 @@ static webgpu_encoded_op ggml_webgpu_ssm_conv(webgpu_context & ctx,
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
+// DeepSeek-V4 ops (LIGHTNING_INDEXER, DSV4_HC_PRE/POST/COMB, POOL_1D): offsets and strides go to the shaders in
+// elements of each tensor's type
+static uint32_t ggml_webgpu_elem_offset(webgpu_context & ctx, const ggml_tensor * t) {
+    return (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, t) / ggml_type_size(t->type));
+}
+
+static uint32_t ggml_webgpu_elem_stride(const ggml_tensor * t, int dim) {
+    return (uint32_t) (t->nb[dim] / ggml_type_size(t->type));
+}
+
+// one thread per item, n_items spread over a 2-D grid of workgroups
+static webgpu_encoded_op ggml_webgpu_build_items(webgpu_context &                  ctx,
+                                                 webgpu_pipeline &                 pipeline,
+                                                 std::vector<uint32_t>             params,
+                                                 std::vector<wgpu::BindGroupEntry> entries,
+                                                 uint64_t                          n_items) {
+    const uint32_t wg_size = static_cast<ggml_webgpu_generic_shader_decisions *>(pipeline.context.get())->wg_size;
+    uint32_t       wg_x, wg_y;
+    compute_2d_workgroups((uint32_t) CEIL_DIV(n_items, (uint64_t) wg_size),
+                          ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+}
+
+static uint32_t ggml_webgpu_items_wg_size(webgpu_context & ctx) {
+    return std::min(256u, ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup);
+}
+
+static webgpu_encoded_op ggml_webgpu_dsv4_hc_pre(webgpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * w     = dst->src[1];
+    const bool          gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    webgpu_pipeline pipeline = ctx->shader_lib->get_named_pipeline(
+        gated ? "dsv4_hc_pre_gated" : "dsv4_hc_pre", wgsl_dsv4_hc,
+        gated ? std::vector<std::string>{ "HC_PRE", "GATED" } : std::vector<std::string>{ "HC_PRE" },
+        ggml_webgpu_items_wg_size(ctx));
+
+    std::vector<uint32_t> params = {
+        ggml_webgpu_elem_offset(ctx, x),
+        ggml_webgpu_elem_offset(ctx, w),
+        ggml_webgpu_elem_offset(ctx, dst),
+        ggml_webgpu_elem_stride(x, 1),
+        ggml_webgpu_elem_stride(x, 2),
+        ggml_webgpu_elem_stride(w, 0),
+        ggml_webgpu_elem_stride(w, 1),
+        ggml_webgpu_elem_stride(w, 2),
+        ggml_webgpu_elem_stride(dst, 1),
+        (uint32_t) x->ne[0],
+        (uint32_t) x->ne[1],
+        (uint32_t) x->ne[2],
+        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, (ggml_tensor *) x),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, (ggml_tensor *) w),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst),
+    };
+    return ggml_webgpu_build_items(ctx, pipeline, params, entries, (uint64_t) x->ne[0] * x->ne[2]);
+}
+
+static webgpu_encoded_op ggml_webgpu_dsv4_hc_post(webgpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * comb     = dst->src[3];
+
+    webgpu_pipeline pipeline = ctx->shader_lib->get_named_pipeline(
+        comb ? "dsv4_hc_post_comb" : "dsv4_hc_post", wgsl_dsv4_hc,
+        comb ? std::vector<std::string>{ "HC_POST", "HAS_COMB" } : std::vector<std::string>{ "HC_POST" },
+        ggml_webgpu_items_wg_size(ctx));
+
+    std::vector<uint32_t> params = {
+        ggml_webgpu_elem_offset(ctx, x),
+        ggml_webgpu_elem_offset(ctx, residual),
+        ggml_webgpu_elem_offset(ctx, post),
+        comb ? ggml_webgpu_elem_offset(ctx, comb) : 0u,
+        ggml_webgpu_elem_offset(ctx, dst),
+        ggml_webgpu_elem_stride(x, 1),
+        ggml_webgpu_elem_stride(residual, 1),
+        ggml_webgpu_elem_stride(residual, 2),
+        ggml_webgpu_elem_stride(post, 0),
+        ggml_webgpu_elem_stride(post, 1),
+        comb ? ggml_webgpu_elem_stride(comb, 0) : 0u,
+        comb ? ggml_webgpu_elem_stride(comb, 1) : 0u,
+        comb ? ggml_webgpu_elem_stride(comb, 2) : 0u,
+        ggml_webgpu_elem_stride(dst, 1),
+        ggml_webgpu_elem_stride(dst, 2),
+        (uint32_t) dst->ne[0],
+        (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2],
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, (ggml_tensor *) x),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, (ggml_tensor *) residual),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, (ggml_tensor *) post),
+    };
+    if (comb) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, (ggml_tensor *) comb));
+    }
+    entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, (uint32_t) entries.size(), dst));
+    return ggml_webgpu_build_items(ctx, pipeline, params, entries, (uint64_t) ggml_nelements(dst));
+}
+
+static webgpu_encoded_op ggml_webgpu_dsv4_hc_comb(webgpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+
+    webgpu_pipeline pipeline =
+        ctx->shader_lib->get_named_pipeline("dsv4_hc_comb", wgsl_dsv4_hc, { "HC_COMB" }, 64u);
+
+    std::vector<uint32_t> params = {
+        ggml_webgpu_elem_offset(ctx, mixes),
+        ggml_webgpu_elem_offset(ctx, scale),
+        ggml_webgpu_elem_offset(ctx, base),
+        ggml_webgpu_elem_offset(ctx, dst),
+        ggml_webgpu_elem_stride(mixes, 0),
+        ggml_webgpu_elem_stride(mixes, 1),
+        ggml_webgpu_elem_stride(scale, 0),
+        ggml_webgpu_elem_stride(base, 0),
+        ggml_webgpu_elem_stride(dst, 0),
+        ggml_webgpu_elem_stride(dst, 1),
+        ggml_webgpu_elem_stride(dst, 2),
+        (uint32_t) mixes->ne[1],
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
+        ggml_webgpu_u32_from_f32(ggml_get_op_params_f32(dst, 0)),
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, (ggml_tensor *) mixes),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, (ggml_tensor *) scale),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, (ggml_tensor *) base),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, dst),
+    };
+    return ggml_webgpu_build_items(ctx, pipeline, params, entries, (uint64_t) mixes->ne[1]);
+}
+
+static webgpu_encoded_op ggml_webgpu_lightning_indexer(webgpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2];
+    const ggml_tensor * m = dst->src[3];
+
+    constexpr uint32_t wg_size  = 64u;  // threads per output, splitting the heads; a power of two for the reduction
+    const bool         k_f16    = k->type == GGML_TYPE_F16;
+    webgpu_pipeline    pipeline = ctx->shader_lib->get_named_pipeline(
+        k_f16 ? "lightning_indexer_k_f16" : "lightning_indexer", wgsl_lightning_indexer,
+        k_f16 ? std::vector<std::string>{ "K_F16" } : std::vector<std::string>{}, wg_size);
+
+    const uint32_t n_kv = (uint32_t) k->ne[2], n_tokens = (uint32_t) q->ne[2], n_stream = (uint32_t) q->ne[3];
+    std::vector<uint32_t> params = {
+        ggml_webgpu_elem_offset(ctx, q),
+        ggml_webgpu_elem_offset(ctx, k),
+        ggml_webgpu_elem_offset(ctx, w),
+        ggml_webgpu_elem_offset(ctx, m),
+        ggml_webgpu_elem_offset(ctx, dst),
+        ggml_webgpu_elem_stride(q, 1),
+        ggml_webgpu_elem_stride(q, 2),
+        ggml_webgpu_elem_stride(q, 3),
+        ggml_webgpu_elem_stride(k, 2),
+        ggml_webgpu_elem_stride(k, 3),
+        ggml_webgpu_elem_stride(w, 1),
+        ggml_webgpu_elem_stride(w, 3),
+        ggml_webgpu_elem_stride(m, 1),
+        ggml_webgpu_elem_stride(m, 3),
+        ggml_webgpu_elem_stride(dst, 1),
+        ggml_webgpu_elem_stride(dst, 3),
+        (uint32_t) q->ne[0],
+        (uint32_t) q->ne[1],
+        n_tokens,
+        n_kv,
+        n_stream,
+        (uint32_t) m->ne[3],
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, (ggml_tensor *) q),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, (ggml_tensor *) k),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, (ggml_tensor *) w),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, (ggml_tensor *) m),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, dst),
+    };
+    // one workgroup per output
+    uint32_t wg_x, wg_y;
+    compute_2d_workgroups(n_kv * n_tokens * n_stream,
+                          ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+}
+
+static webgpu_encoded_op ggml_webgpu_pool_1d(webgpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src  = dst->src[0];
+    const int32_t *     opts = (const int32_t *) dst->op_params;
+    const bool          pmax = opts[0] == GGML_OP_POOL_MAX;
+    const bool          f16  = src->type == GGML_TYPE_F16;
+
+    std::vector<std::string> defines;
+    std::string              variant = "pool_1d";
+    if (pmax) {
+        defines.push_back("POOL_MAX");
+        variant += "_max";
+    }
+    if (f16) {
+        defines.push_back("SRC_F16");
+        variant += "_f16";
+    }
+    webgpu_pipeline pipeline =
+        ctx->shader_lib->get_named_pipeline(variant, wgsl_pool_1d, defines, ggml_webgpu_items_wg_size(ctx));
+
+    std::vector<uint32_t> params = {
+        ggml_webgpu_elem_offset(ctx, src),
+        ggml_webgpu_elem_offset(ctx, dst),
+        ggml_webgpu_elem_stride(src, 1),
+        ggml_webgpu_elem_stride(dst, 1),
+        (uint32_t) src->ne[0],
+        (uint32_t) dst->ne[0],
+        (uint32_t) ggml_nrows(src),
+        (uint32_t) opts[1],
+        (uint32_t) opts[2],
+        (uint32_t) opts[3],
+    };
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, (ggml_tensor *) src),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst),
+    };
+    return ggml_webgpu_build_items(ctx, pipeline, params, entries, (uint64_t) ggml_nelements(dst));
+}
+
 static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
                                               ggml_tensor *    src0,
                                               ggml_tensor *    src1,
@@ -3569,6 +3794,7 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
         case GGML_OP_L2_NORM:
             return ggml_webgpu_row_norm(ctx, src0, node);
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
             return ggml_webgpu_rope(ctx, src0, src1, src2, node);
         case GGML_OP_GLU:
             return ggml_webgpu_glu(ctx, src0, src1, node);
@@ -3591,6 +3817,16 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_solve_tri(ctx, src0, src1, node);
         case GGML_OP_SSM_CONV:
             return ggml_webgpu_ssm_conv(ctx, src0, src1, node);
+        case GGML_OP_LIGHTNING_INDEXER:
+            return ggml_webgpu_lightning_indexer(ctx, node);
+        case GGML_OP_DSV4_HC_PRE:
+            return ggml_webgpu_dsv4_hc_pre(ctx, node);
+        case GGML_OP_DSV4_HC_POST:
+            return ggml_webgpu_dsv4_hc_post(ctx, node);
+        case GGML_OP_DSV4_HC_COMB:
+            return ggml_webgpu_dsv4_hc_comb(ctx, node);
+        case GGML_OP_POOL_1D:
+            return ggml_webgpu_pool_1d(ctx, node);
         case GGML_OP_SSM_SCAN:
             return ggml_webgpu_ssm_scan(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node->src[6],
                                         node);
@@ -5375,6 +5611,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             supports_op = (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32) && ggml_is_contiguous_rows(src0);
             break;
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
             supports_op = op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
             break;
         case GGML_OP_GLU:
@@ -5461,6 +5698,29 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_SSM_CONV:
             supports_op = op->type == GGML_TYPE_F32;
+            break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            // the shaders index dim 0 as contiguous
+            supports_op = (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && src0->nb[0] == sizeof(float) &&
+                          src1->nb[0] == ggml_type_size(src1->type) && src2->nb[0] == sizeof(float) &&
+                          op->src[3]->nb[0] == sizeof(ggml_fp16_t) && op->nb[0] == sizeof(float);
+            break;
+        case GGML_OP_DSV4_HC_PRE:
+            supports_op = src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+            break;
+        case GGML_OP_DSV4_HC_POST:
+            supports_op = src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+            break;
+        case GGML_OP_DSV4_HC_COMB:
+            supports_op = op->type == GGML_TYPE_F32;
+            break;
+        case GGML_OP_POOL_1D:
+            {
+                const int32_t pool = ggml_get_op_params_i32(op, 0);
+                supports_op = (pool == GGML_OP_POOL_MAX || pool == GGML_OP_POOL_AVG) &&
+                              (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+                              src0->nb[0] == ggml_type_size(src0->type) && op->nb[0] == sizeof(float);
+            }
             break;
         case GGML_OP_SSM_SCAN:
             supports_op = op->type == GGML_TYPE_F32 &&

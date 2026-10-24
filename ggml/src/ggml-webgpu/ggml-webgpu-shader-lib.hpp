@@ -1154,9 +1154,10 @@ struct ggml_webgpu_rope_pipeline_key {
     ggml_type type;
     bool      inplace;
     bool      has_ff;
+    bool      backward;
 
     bool operator==(const ggml_webgpu_rope_pipeline_key & other) const {
-        return type == other.type && inplace == other.inplace && has_ff == other.has_ff;
+        return type == other.type && inplace == other.inplace && has_ff == other.has_ff && backward == other.backward;
     }
 };
 
@@ -1166,6 +1167,7 @@ struct ggml_webgpu_rope_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.type);
         ggml_webgpu_hash_combine(seed, key.inplace);
         ggml_webgpu_hash_combine(seed, key.has_ff);
+        ggml_webgpu_hash_combine(seed, key.backward);
         return seed;
     }
 };
@@ -1254,6 +1256,7 @@ class ggml_webgpu_shader_lib {
         solve_tri_pipelines;  // type
     std::unordered_map<ggml_webgpu_ssm_conv_pipeline_key, webgpu_pipeline, ggml_webgpu_ssm_conv_pipeline_key_hash>
         ssm_conv_pipelines;   // type/vectorized
+    std::unordered_map<std::string, webgpu_pipeline> named_pipelines;  // keyed by variant name (DeepSeek-V4 ops)
     std::unordered_map<ggml_webgpu_ssm_scan_pipeline_key, webgpu_pipeline, ggml_webgpu_ssm_scan_pipeline_key_hash>
         ssm_scan_pipelines;   // type/d_state
     std::unordered_map<ggml_webgpu_gated_delta_net_pipeline_key,
@@ -1804,6 +1807,26 @@ class ggml_webgpu_shader_lib {
         pipeline.context         = decisions;
         solve_tri_pipelines[key] = pipeline;
         return solve_tri_pipelines[key];
+    }
+
+    // a pipeline whose variant name fully determines its defines, built once per name
+    webgpu_pipeline get_named_pipeline(const std::string &              variant,
+                                       const char *                     shader_src,
+                                       const std::vector<std::string> & defines,
+                                       uint32_t                         wg_size) {
+        auto it = named_pipelines.find(variant);
+        if (it != named_pipelines.end()) {
+            return it->second;
+        }
+        std::vector<std::string> all = defines;
+        all.push_back("WG_SIZE=" + std::to_string(wg_size));
+        auto processed            = preprocessor.preprocess(shader_src, all);
+        auto decisions            = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size        = wg_size;
+        webgpu_pipeline pipeline  = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context          = decisions;
+        named_pipelines[variant]  = pipeline;
+        return pipeline;
     }
 
     webgpu_pipeline get_ssm_conv_pipeline(const ggml_webgpu_shader_lib_context & context) {
@@ -3287,6 +3310,7 @@ class ggml_webgpu_shader_lib {
         key.type                          = context.dst->type;
         key.inplace                       = ggml_webgpu_tensor_equal(context.src0, context.dst);
         key.has_ff                        = (context.src2 != nullptr);
+        key.backward                      = context.dst->op == GGML_OP_ROPE_BACK;
 
         auto it = rope_pipelines.find(key);
         if (it != rope_pipelines.end()) {
@@ -3317,6 +3341,11 @@ class ggml_webgpu_shader_lib {
         if (key.has_ff) {
             defines.push_back("FF_FUNC");
             variant += "_ff";
+        }
+
+        if (key.backward) {
+            defines.push_back("BACKWARD");
+            variant += "_back";
         }
 
         defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
