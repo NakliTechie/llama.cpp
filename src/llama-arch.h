@@ -801,6 +801,10 @@ enum llm_tensor {
     LLM_TENSOR_ENGRAM_WKV,     // ISTA-DASLab layout: engram_kv under its checkpoint name
     LLM_TENSOR_ENGRAM_Q,       // ISTA-DASLab layout: the gate's halves, unfused (gate = q * k)
     LLM_TENSOR_ENGRAM_K,
+    LLM_TENSOR_ENGRAM_TOKEN_MAP,   // ISTA-DASLab layout: the hash constants as tensors, read into hparams
+    LLM_TENSOR_ENGRAM_PRIMES,
+    LLM_TENSOR_ENGRAM_OFFSETS,
+    LLM_TENSOR_ENGRAM_MULTIPLIERS,
     LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
     LLM_TENSOR_DFLASH_ATTN_CONV_PROJ,
     LLM_TENSOR_DFLASH_FFN_CONV_BASE,

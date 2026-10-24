@@ -209,6 +209,12 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
     if (!engram_file.empty()) {
+        // ISTA layout: the hash constants were read into hparams; count them as used, load nothing
+        for (const llm_tensor t : { LLM_TENSOR_ENGRAM_TOKEN_MAP, LLM_TENSOR_ENGRAM_PRIMES, LLM_TENSOR_ENGRAM_OFFSETS, LLM_TENSOR_ENGRAM_MULTIPLIERS }) {
+            const ggml_tensor * m = ml.get_weight(tn(t, "weight").str().c_str())->tensor;
+            create_tensor(tn(t, "weight"), {m->ne[0], m->ne[1]}, TENSOR_SKIP);
+        }
+
         // ISTA layout: find each table in the Engram GGUF; rows are read in engram_read_rows
         struct ggml_context * ectx = nullptr;
         gguf_context_ptr meta(gguf_init_from_file(engram_file.c_str(), { /*.no_alloc =*/ true, /*.ctx =*/ &ectx }));
